@@ -1,0 +1,9 @@
+node_modules/
+.env
+work/
+logs/
+output/
+.DS_Store
+.pnpm-cache
+.pnpm-store
+.npm-cache

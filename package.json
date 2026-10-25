@@ -1,0 +1,21 @@
+{
+  "name": "changan-monitor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:init": "node --experimental-strip-types src/jobs/db-init.ts",
+    "db:sync-accounts": "node --experimental-strip-types src/jobs/sync-accounts.ts",
+    "login": "node --experimental-strip-types src/jobs/login.ts",
+    "monitor": "node --experimental-strip-types src/jobs/monitor.ts",
+    "web:dev": "pnpm --dir web dev",
+    "web:build": "pnpm --dir web build"
+  },
+  "dependencies": {
+    "pg": "^8.22.0",
+    "playwright": "^1.61.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "@types/pg": "^8.20.0"
+  }
+}
