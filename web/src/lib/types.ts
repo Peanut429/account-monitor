@@ -115,3 +115,30 @@ export type PostDetail = {
   lastSeenTsMs: number;
   snapshots: SnapshotRow[];
 };
+
+export type ManagedAccount = {
+  id: string;
+  platformCode: string;
+  platformName: string;
+  handle: string;
+  displayName: string | null;
+  profileUrl: string;
+  accountType: string | null;
+  active: boolean;
+  followers: number | null;
+  lastRunStatus: string | null;
+  lastRunErrorMessage: string | null;
+  lastRunFinishedTsMs: number | null;
+  posts72h: number;
+  createdTsMs: number;
+};
+
+export type PlatformOption = {
+  code: string;
+  name: string;
+};
+
+export type AccountManagementData = {
+  accounts: ManagedAccount[];
+  platforms: PlatformOption[];
+};

@@ -27,13 +27,14 @@ export async function releaseCycleLock(): Promise<void> {
   }
 }
 
-export async function listAccounts(accountType: string): Promise<AccountRow[]> {
+export async function listAccounts(accountType?: string | null): Promise<AccountRow[]> {
   const result = await pool.query(
     `select id, platform_code, handle, display_name, profile_url
      from accounts
-     where active = true and account_type = $1
+     where active = true
+       and ($1::text is null or account_type = $1)
      order by platform_code, handle`,
-    [accountType],
+    [accountType || null],
   );
   return result.rows.map((row) => ({
     id: row.id,

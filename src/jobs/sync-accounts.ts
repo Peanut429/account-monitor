@@ -16,7 +16,8 @@ async function main(): Promise<void> {
   if (!targetUrlText) throw new Error("缺少 DATABASE_URL");
 
   const sourceDbName = process.env.SOURCE_DB_NAME || "changan_social_data";
-  const accountType = process.env.MONITOR_ACCOUNT_TYPE || "欧洲";
+  // 只影响从参考库导入哪一类账号；不影响新库里的监控选择。
+  const accountType = process.env.SYNC_ACCOUNT_TYPE || process.env.MONITOR_ACCOUNT_TYPE || "欧洲";
 
   const source = new Pool({ connectionString: buildSourceUrl(targetUrlText, sourceDbName) });
   const target = new Pool({ connectionString: targetUrlText });
@@ -58,7 +59,6 @@ async function main(): Promise<void> {
              display_name = excluded.display_name,
              profile_url = excluded.profile_url,
              account_type = excluded.account_type,
-             active = true,
              updated_ts_ms = excluded.updated_ts_ms`,
           [row.code, row.handle, row.display_name, row.profile_url, accountType, now],
         );

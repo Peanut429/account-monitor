@@ -8,7 +8,7 @@ export const Route = createRootRoute({
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "Changan Monitor" },
-      { name: "description", content: "6 平台欧洲账号 72 小时帖子监控" },
+      { name: "description", content: "6 平台账号 72 小时帖子监控" },
     ],
   }),
   component: RootComponent,
@@ -34,10 +34,15 @@ function RootComponent() {
           <Link to="/" className="brand">
             <span className="brand-mark" />
             <span>Changan Monitor</span>
-            <span className="brand-sub">欧洲账号 · 72h</span>
+            <span className="brand-sub">账号监控 · 72h</span>
           </Link>
           <nav className="nav">
-            <Link to="/">账号总览</Link>
+            <Link to="/" activeOptions={{ exact: true }} activeProps={{ className: "active" }}>
+              账号总览
+            </Link>
+            <Link to="/manage/accounts" activeProps={{ className: "active" }}>
+              账号管理
+            </Link>
           </nav>
         </div>
       </header>

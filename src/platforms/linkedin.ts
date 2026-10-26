@@ -21,15 +21,48 @@ function activityIdToTsMs(activityId: string): number | null {
   }
 }
 
+const LINKEDIN_REACTIONS_RE = /(?:([\d.,]+\s*[KMB]?)\s*(?:reactions?|likes?|人赞|个赞|次赞|点赞|赞)|(?:点赞|赞)\s*([\d.,]+\s*[KMB]?))/i;
+const LINKEDIN_COMMENTS_RE = /([\d.,]+\s*[KMB]?)\s*(?:comments?|条评论|次评论|评论)/i;
+const LINKEDIN_SHARES_RE = /(?:([\d.,]+\s*[KMB]?)\s*(?:reposts?|shares?|次转发|次分享)|(?:转发了?|分享了?)\s*([\d.,]+\s*[KMB]?)\s*次)/i;
+const LINKEDIN_IMPRESSIONS_RE = /([\d.,]+\s*[KMB]?)\s*(?:impressions?|次展示|展示|views?)/i;
+
 function pickCount(labels: string[], countsText: string, pattern: RegExp): number | null {
   for (const value of [...labels, countsText]) {
     const match = pattern.exec(String(value || ""));
-    if (match) {
-      const parsed = parseCount(match[1]);
+    if (!match) continue;
+    // 有的正则有两个分支，数字可能在 match[2]
+    for (let index = 1; index < match.length; index += 1) {
+      if (match[index] == null) continue;
+      const parsed = parseCount(match[index]);
       if (parsed != null) return parsed;
     }
   }
   return null;
+}
+
+/**
+ * LinkedIn 页面语言会影响按钮文案：
+ *   英文：22 impressions / 2 comments / 2 reposts
+ *   中文：22 次展示 / 2 条评论 / 被转发了 2 次
+ * 这里把中英文都归一成入库字段。
+ */
+export function parseLinkedInCounts(labels: string[], countsText: string): {
+  reads: number | null;
+  likes: number | null;
+  comments: number | null;
+  shares: number | null;
+} {
+  // countsText 形如 "22 2 条评论 2 次转发"，开头的 22 是展示数；
+  // 有些卡片没有 "22 次展示" 的 label，只能用这个兜底。
+  const first = /^\s*([\d.,]+\s*[KMB]?)/i.exec(countsText);
+  const fallbackReads = first ? parseCount(first[1]) : null;
+
+  return {
+    reads: pickCount(labels, countsText, LINKEDIN_IMPRESSIONS_RE) ?? fallbackReads,
+    likes: pickCount(labels, countsText, LINKEDIN_REACTIONS_RE),
+    comments: pickCount(labels, countsText, LINKEDIN_COMMENTS_RE),
+    shares: pickCount(labels, countsText, LINKEDIN_SHARES_RE),
+  };
 }
 
 async function readCards(page: Page): Promise<LinkedInCard[]> {
@@ -114,6 +147,8 @@ async function scrapeLinkedIn({
       if (publishedTsMs == null || publishedTsMs < sinceTsMs || publishedTsMs >= untilTsMs) continue;
       if (posts.has(card.activityId)) continue;
 
+      const counts = parseLinkedInCounts(card.labels, card.countsText);
+
       posts.set(card.activityId, {
         externalId: card.activityId,
         url: `https://www.linkedin.com/feed/update/urn:li:activity:${card.activityId}/`,
@@ -124,11 +159,11 @@ async function scrapeLinkedIn({
         text: card.text,
         metrics: {
           views: null,
-          likes: pickCount(card.labels, card.countsText, /([\d.,]+\s*[KMB]?)\s*(?:reactions?|likes?)/i),
-          comments: pickCount(card.labels, card.countsText, /([\d.,]+\s*[KMB]?)\s*comments?/i),
-          shares: pickCount(card.labels, card.countsText, /([\d.,]+\s*[KMB]?)\s*(?:reposts?|shares?)/i),
+          likes: counts.likes,
+          comments: counts.comments,
+          shares: counts.shares,
           saves: null,
-          reads: null,
+          reads: counts.reads,
         },
         raw: {
           activityId: card.activityId,

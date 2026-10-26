@@ -2,7 +2,8 @@
 
 ## 1. 这个项目做什么
 
-- 监控 6 个平台的欧洲账号主页：X、YouTube、Instagram、Facebook、LinkedIn、TikTok。
+- 监控 6 个平台的主页：X、YouTube、Instagram、Facebook、LinkedIn、TikTok。
+- 默认从参考库同步欧洲账号；**监控本身不按 `account_type` 过滤，`active = true` 的账号都会抓**。
 - 每个周期执行一次；每次窗口是执行时刻往前 72 小时，左闭右开：`[now-72h, now)`。
 - 只抓主页帖子列表里可见的帖子，以及账号本身的粉丝/关注/帖子数。
 - 窗口内每篇帖子写一条指标快照（`post_metrics`），所以同一帖子跨周期会有多条记录，可以直接算增长。
@@ -38,7 +39,9 @@ pnpm run db:init
 pnpm run db:sync-accounts
 ```
 
-`db:sync-accounts` 会连参考库的 `changan_social_data`，把 `social_accounts.account_type = '欧洲'` 的启用账号同步到 `accounts`。目前是 41 个：
+`db:sync-accounts` 会连参考库的 `changan_social_data`，把 `social_accounts.account_type = '欧洲'` 的启用账号同步到 `accounts`。目前是 41 个。
+
+同步只影响“导入哪些账号”，不影响监控选择：同步进来或手工新增的账号，只要 `active = true` 都会进入下一轮监控。
 
 | 平台 | 账号数 |
 |---|---:|
@@ -79,7 +82,7 @@ pnpm run monitor --platform tiktok --limit 1
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MONITOR_ACCOUNT_TYPE` | `欧洲` | 抓哪类账号 |
+| `SYNC_ACCOUNT_TYPE` | `欧洲` | `db:sync-accounts` 从参考库导入哪类账号；不影响监控 |
 | `MONITOR_WINDOW_HOURS` | `72` | 窗口小时数 |
 | `MONITOR_CONCURRENCY` | `3` | 同时抓几个账号 |
 | `MONITOR_ACCOUNT_TIMEOUT_MS` | `300000` | 单账号超时 |
@@ -91,7 +94,7 @@ pnpm run monitor --platform tiktok --limit 1
 运行逻辑：
 
 1. 取 PG advisory lock；上一轮没结束就跳过。
-2. 读 `accounts` 里 `active=true and account_type='欧洲'` 的账号。
+2. 读 `accounts` 里 `active = true` 的账号（不按 `account_type` 过滤）。
 3. 建 `monitor_cycles`，窗口 `[now-72h, now)`。
 4. 每个账号建 `monitor_runs`，按平台 adapter 抓取。
 5. 帖子和指标在一个事务里写入；成功/失败都更新 run。
@@ -177,7 +180,7 @@ pnpm install
 pnpm dev
 ```
 
-打开 <http://127.0.0.1:3000>。也可以在项目根目录跑：
+打开 <http://127.0.0.1:3000/account-monitor/>。也可以在项目根目录跑：
 
 ```bash
 pnpm run web:dev
@@ -189,9 +192,22 @@ pnpm run web:dev
 
 | 路径 | 内容 |
 |---|---|
-| `/` | 账号列表：平台筛选、搜索、粉丝/帖子数/近 72h 帖子/快照数/最近抓取/状态 |
-| `/accounts/:accountId` | 账号详情：账号指标 + 帖子列表（近 72h / 全部历史） |
-| `/accounts/:accountId/posts/:postId` | 帖子详情：最新指标、增长、4 张趋势图、全部快照、原始 JSON、CSV 导出 |
+| `/account-monitor/` | 账号列表：平台筛选、搜索、粉丝/帖子数/近 72h 帖子/快照数/最近抓取/状态 |
+| `/account-monitor/accounts/:accountId` | 账号详情：账号指标 + 帖子列表（近 72h / 全部历史） |
+| `/account-monitor/accounts/:accountId/posts/:postId` | 帖子详情：最新指标、增长、4 张趋势图、全部快照、原始 JSON、CSV 导出 |
+| `/account-monitor/manage/accounts` | 账号管理：启用/停用账号、添加账号 |
+
+账号管理说明：
+
+- 停用不会删除历史数据，只是不再进入新的监控周期；启用后下一轮开始抓取。
+- 新增账号默认启用，下一轮监控开始处理。
+- 只要账号是启用状态（`active = true`），就会进入下一轮监控；`account_type` 只是分类标签，不影响是否抓取。
+- 目前不做物理删除，避免误删历史数据。
+- 重新跑 `pnpm run db:sync-accounts` 只会更新账号资料，**不会覆盖**在 Web 里设置的启用/停用状态。
+
+![账号管理](screenshots/manage.png)
+
+![添加账号](screenshots/manage-add.png)
 
 ### 数据口径
 
@@ -211,73 +227,12 @@ pnpm run web:dev
 pnpm run web:build
 ```
 
-当前本地看数据用 `pnpm dev` 就够了；要长期挂后台，可以给 web 也配一个 launchd，或者用 `vite preview`/Node 跑构建产物。
+本地开发用 `pnpm dev`。生产部署用 `pnpm build` 生成自包含的 `.output`，再按 [Web 部署手册](web-deploy.md) 部署到 Linux + Nginx；服务器不需要安装 pnpm 依赖。
 
 
 ## 10. Windows 运行
 
-`deploy/com.changan.monitor.plist` 是 macOS launchd 专用，Windows 不能用，也不需要它。
-Windows 用 `scripts/run-monitor.bat` + 任务计划程序。
+Windows 不能用 `deploy/com.changan.monitor.plist`（那是 macOS launchd 专用）。
+启动、关闭、查看日志、常见问题全部整理在：
 
-### 10.1 环境
-
-- Node.js 24（要支持 `--experimental-strip-types`）
-- pnpm
-- Google Chrome
-- 在项目根目录执行过 `pnpm install` 和 `pnpm run db:init` / `db:sync-accounts`
-
-`.env` 里 Chrome 路径改成 Windows 的，例如：
-
-```dotenv
-MONITOR_CHROME_EXECUTABLE=C:\Program Files\Google\Chrome\Application\chrome.exe
-```
-
-`MONITOR_USER_DATA_DIR` 保持 `work/playwright-profile` 即可，代码里会按项目目录解析。
-TikHub 的 4 个平台不需要 Chrome；只有 Facebook / LinkedIn 会用到。
-
-### 10.2 手动跑
-
-```bat
-cd C:\path\to\changan-monitor
-pnpm run monitor
-```
-
-或者直接双击/执行：
-
-```bat
-scripts\run-monitor.bat
-```
-
-日志在 `logs\monitor.log`。
-
-### 10.3 任务计划程序（每小时）
-
-用管理员或当前用户打开 cmd，执行（把路径换成实际项目路径）：
-
-```bat
-schtasks /Create /TN "ChanganMonitor" /TR "C:\path\to\changan-monitor\scripts\run-monitor.bat" /SC HOURLY /MO 1 /ST 00:05 /RL LIMITED /IT /F
-```
-
-说明：
-
-- `/SC HOURLY /MO 1`：每小时一次，从 `00:05` 开始。
-- `/IT`：只在当前用户登录时运行。Facebook / LinkedIn 需要可见浏览器，必须保留这个参数；不要用“不管用户是否登录都要运行”的服务方式。
-- `/RL LIMITED`：普通权限运行。
-
-查看/删除：
-
-```bat
-schtasks /Query /TN "ChanganMonitor" /V /FO LIST
-schtasks /Delete /TN "ChanganMonitor" /F
-```
-
-如果 Windows 会休眠，任务同样可能漏跑；要严格每小时，需要关闭休眠或放服务器。
-
-### 10.4 Web 页面
-
-```bat
-cd C:\path\to\changan-monitor
-pnpm run web:dev
-```
-
-打开 <http://127.0.0.1:3000>。Web 是常驻进程，和监控的每小时任务分开；要开机常驻可以再用任务计划程序/NSSM 托管。
+[Windows 定时任务手册](windows-task.md)

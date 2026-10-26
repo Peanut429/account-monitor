@@ -75,7 +75,9 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   const windowHours = Number(args["window-hours"] || process.env.MONITOR_WINDOW_HOURS || 72);
-  const accountType = args["account-type"] || process.env.MONITOR_ACCOUNT_TYPE || "欧洲";
+  // 默认不按 account_type 过滤：库里 active = true 的账号全部监控。
+  // --account-type 只作为临时调试过滤条件保留。
+  const accountType = args["account-type"] || "";
   const timeoutMs = Number(process.env.MONITOR_ACCOUNT_TIMEOUT_MS || 300_000);
   const concurrency = Math.max(1, Number(args.concurrency || process.env.MONITOR_CONCURRENCY || 3));
   const platformFilter = (args.platform || "")
@@ -100,7 +102,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    accounts = await listAccounts(accountType);
+    accounts = await listAccounts(accountType || null);
     if (platformFilter.length) {
       accounts = accounts.filter((account) => platformFilter.includes(account.platformCode));
     }
@@ -111,7 +113,9 @@ async function main(): Promise<void> {
       accounts = accounts.slice(0, Number(args.limit));
     }
     if (!accounts.length) {
-      throw new Error(`没有找到 account_type=${accountType} 的启用账号`);
+      throw new Error(accountType
+        ? `没有找到 account_type=${accountType} 的启用账号`
+        : "没有找到启用账号");
     }
 
     cycleId = await createCycle(sinceTsMs, untilTsMs);
@@ -124,7 +128,7 @@ async function main(): Promise<void> {
       level: "info",
       step: "cycle_start",
       message: `开始周期：${accounts.length} 个账号`,
-      extra: { context: { accountType, windowHours, concurrency, platformFilter } },
+      extra: { context: { accountType: accountType || "all", windowHours, concurrency, platformFilter } },
     });
 
     const needsBrowser = accounts.some((account) => {

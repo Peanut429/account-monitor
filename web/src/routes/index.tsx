@@ -38,7 +38,7 @@ function AccountsPage() {
         <div>
           <h1 className="page-title">账号总览</h1>
           <div className="page-sub">
-            6 个平台 · {overview.accounts} 个欧洲账号 · 每次抓取近 72 小时
+            6 个平台 · {overview.accounts} 个启用账号 · 每次抓取近 72 小时
           </div>
         </div>
         <div className="page-actions">
@@ -80,11 +80,6 @@ function AccountsPage() {
       {!latestCycle ? (
         <div className="banner banner-info">
           还没有监控数据。先在项目根目录跑一轮 <code>pnpm run monitor</code>，这里就会出现账号和帖子。
-        </div>
-      ) : latestCycle.failedRuns > 0 ? (
-        <div className="banner banner-error">
-          最近周期有 {latestCycle.failedRuns} 个账号失败（开始于 {formatFullTs(latestCycle.startedTsMs)}）。
-          点进账号看具体错误，常见原因是登录态失效。
         </div>
       ) : null}
 

@@ -1,11 +1,14 @@
 import { createServerFn } from "@tanstack/react-start";
-import { rows } from "./db";
+import { pool, rows } from "./db";
 import type {
   AccountDetail,
   AccountListItem,
+  AccountManagementData,
   CycleSummary,
   MetricSnapshot,
+  ManagedAccount,
   Overview,
+  PlatformOption,
   PlatformSummary,
   PostDetail,
   PostListItem,
@@ -13,7 +16,6 @@ import type {
 } from "~/lib/types";
 
 const WINDOW_MS = 72 * 3_600_000;
-const ACCOUNT_TYPE = process.env.MONITOR_ACCOUNT_TYPE || "欧洲";
 
 function num(value: unknown): number | null {
   if (value == null || value === "") return null;
@@ -48,26 +50,26 @@ async function getOverviewData(): Promise<Overview> {
 
   const [counts] = await rows<any>(
     `select
-       (select count(*)::int from accounts where active = true and account_type = $1) as accounts,
+       (select count(*)::int from accounts where active = true) as accounts,
        (select count(*)::int
           from posts p
           join accounts a on a.id = p.account_id
-         where a.active = true and a.account_type = $1
-           and coalesce(p.published_ts_ms, p.first_seen_ts_ms) >= $2) as posts_72h,
+         where a.active = true
+           and coalesce(p.published_ts_ms, p.first_seen_ts_ms) >= $1) as posts_72h,
        (select count(*)::int
           from post_metrics pm
           join monitor_runs r on r.id = pm.run_id
           join accounts a on a.id = r.account_id
-         where a.account_type = $1 and pm.captured_ts_ms >= $2) as snapshots_72h,
+         where pm.captured_ts_ms >= $1) as snapshots_72h,
        (select count(*)::int
           from monitor_runs r
           join accounts a on a.id = r.account_id
-         where a.account_type = $1 and r.started_ts_ms >= $2) as runs_72h,
+         where r.started_ts_ms >= $1) as runs_72h,
        (select count(*)::int
           from monitor_runs r
           join accounts a on a.id = r.account_id
-         where a.account_type = $1 and r.started_ts_ms >= $2 and r.status = 'failed') as failed_runs_72h`,
-    [ACCOUNT_TYPE, windowStart],
+         where r.started_ts_ms >= $1 and r.status = 'failed') as failed_runs_72h`,
+    [windowStart],
   );
 
   const [cycle] = await rows<any>(
@@ -81,16 +83,16 @@ async function getOverviewData(): Promise<Overview> {
   const platforms = await rows<any>(
     `select p.code, p.name,
             (select count(*)::int from accounts a
-              where a.platform_code = p.code and a.active = true and a.account_type = $1) as accounts,
+              where a.platform_code = p.code and a.active = true) as accounts,
             (select count(*)::int
                from posts po
                join accounts a on a.id = po.account_id
-              where a.platform_code = p.code and a.account_type = $1
-                and coalesce(po.published_ts_ms, po.first_seen_ts_ms) >= $2) as posts_72h
+              where a.platform_code = p.code
+                and coalesce(po.published_ts_ms, po.first_seen_ts_ms) >= $1) as posts_72h
        from platforms p
       where p.enabled = true
       order by p.code`,
-    [ACCOUNT_TYPE, windowStart],
+    [windowStart],
   );
 
   return {
@@ -134,11 +136,11 @@ async function getAccountsData(): Promise<AccountListItem[]> {
        (select count(*)::int
           from posts po
          where po.account_id = a.id
-           and coalesce(po.published_ts_ms, po.first_seen_ts_ms) >= $2) as posts_72h,
+           and coalesce(po.published_ts_ms, po.first_seen_ts_ms) >= $1) as posts_72h,
        (select count(*)::int
           from post_metrics pm
           join monitor_runs r on r.id = pm.run_id
-         where r.account_id = a.id and pm.captured_ts_ms >= $2) as snapshots_72h
+         where r.account_id = a.id and pm.captured_ts_ms >= $1) as snapshots_72h
        from accounts a
        join platforms p on p.code = a.platform_code
        left join lateral (
@@ -153,9 +155,9 @@ async function getAccountsData(): Promise<AccountListItem[]> {
           order by x.started_ts_ms desc
           limit 1
        ) lr on true
-      where a.active = true and a.account_type = $1
+      where a.active = true
       order by p.code, a.handle`,
-    [ACCOUNT_TYPE, windowStart],
+    [windowStart],
   );
 
   return data.map((row): AccountListItem => ({
@@ -340,6 +342,128 @@ async function getPostData(accountId: string, postId: string): Promise<PostDetai
   };
 }
 
+
+async function getAccountManagementData(): Promise<AccountManagementData> {
+  const windowStart = Date.now() - WINDOW_MS;
+  const [accounts, platforms] = await Promise.all([
+    rows<any>(
+      `select
+         a.id, a.platform_code, p.name as platform_name, a.handle, a.display_name, a.profile_url,
+         a.account_type, a.active, a.created_ts_ms,
+         am.followers,
+         lr.status as last_run_status, lr.error_message as last_run_error_message,
+         lr.finished_ts_ms as last_run_finished_ts_ms,
+         (select count(*)::int
+            from posts po
+           where po.account_id = a.id
+             and coalesce(po.published_ts_ms, po.first_seen_ts_ms) >= $1) as posts_72h
+         from accounts a
+         join platforms p on p.code = a.platform_code
+         left join lateral (
+           select * from account_metrics x
+            where x.account_id = a.id
+            order by x.captured_ts_ms desc
+            limit 1
+         ) am on true
+         left join lateral (
+           select * from monitor_runs x
+            where x.account_id = a.id
+            order by x.started_ts_ms desc
+            limit 1
+         ) lr on true
+        order by a.active desc, p.code, a.handle`,
+      [windowStart],
+    ),
+    rows<any>(
+      `select code, name from platforms where enabled = true order by code`,
+    ),
+  ]);
+
+  return {
+    accounts: accounts.map((row): ManagedAccount => ({
+      id: row.id,
+      platformCode: row.platform_code,
+      platformName: row.platform_name,
+      handle: row.handle,
+      displayName: text(row.display_name),
+      profileUrl: row.profile_url,
+      accountType: text(row.account_type),
+      active: Boolean(row.active),
+      followers: num(row.followers),
+      lastRunStatus: text(row.last_run_status),
+      lastRunErrorMessage: text(row.last_run_error_message),
+      lastRunFinishedTsMs: num(row.last_run_finished_ts_ms),
+      posts72h: int(row.posts_72h),
+      createdTsMs: int(row.created_ts_ms),
+    })),
+    platforms: platforms.map((row): PlatformOption => ({ code: row.code, name: row.name })),
+  };
+}
+
+async function createAccountRecord(input: {
+  platformCode: string;
+  handle: string;
+  displayName: string;
+  profileUrl: string;
+  accountType: string;
+  active: boolean;
+}): Promise<{ id: string }> {
+  const platformCode = input.platformCode.trim();
+  const handle = input.handle.trim();
+  const displayName = input.displayName.trim() || handle;
+  const profileUrl = input.profileUrl.trim();
+  const accountType = input.accountType.trim() || "欧洲";
+
+  if (!platformCode || !handle || !profileUrl) {
+    throw new Error("平台、账号、主页链接都不能为空");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(profileUrl);
+  } catch {
+    throw new Error("主页链接格式不正确，需要完整的 http/https 地址");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("主页链接必须是 http/https 地址");
+  }
+
+  const platform = await rows<{ code: string }>(
+    `select code from platforms where code = $1 and enabled = true`,
+    [platformCode],
+  );
+  if (!platform.length) throw new Error(`平台不存在：${platformCode}`);
+
+  const now = Date.now();
+  try {
+    const result = await pool.query(
+      `insert into accounts
+         (id, platform_code, handle, display_name, profile_url, account_type, active, metadata_json, created_ts_ms, updated_ts_ms)
+       values ('acc-' || md5($1 || ':' || $2), $1, $2, $3, $4, $5, $6, '{}'::jsonb, $7, $7)
+       returning id`,
+      [platformCode, handle, displayName, profileUrl, accountType, input.active, now],
+    );
+    return { id: result.rows[0].id };
+  } catch (error: any) {
+    if (error?.code === "23505") {
+      throw new Error(`账号已存在：${platformCode} / ${handle}。如果要恢复，请在列表里直接启用它。`);
+    }
+    throw error;
+  }
+}
+
+async function setAccountActiveRecord(accountId: string, active: boolean): Promise<{ id: string; active: boolean }> {
+  const result = await pool.query(
+    `update accounts
+        set active = $2, updated_ts_ms = $3
+      where id = $1
+      returning id, active`,
+    [accountId, active, Date.now()],
+  );
+  if (!result.rowCount) throw new Error("账号不存在");
+  return { id: result.rows[0].id, active: Boolean(result.rows[0].active) };
+}
+
 export const fetchOverview = createServerFn({ method: "GET" })
   .handler(() => getOverviewData());
 
@@ -363,3 +487,24 @@ export const fetchPost = createServerFn({ method: "GET" })
     postId: String(input?.postId || ""),
   }))
   .handler(({ data }) => getPostData(data.accountId, data.postId));
+
+export const fetchAccountManagement = createServerFn({ method: "GET" })
+  .handler(() => getAccountManagementData());
+
+export const createManagedAccount = createServerFn({ method: "POST" })
+  .validator((input: any) => ({
+    platformCode: String(input?.platformCode || ""),
+    handle: String(input?.handle || ""),
+    displayName: String(input?.displayName || ""),
+    profileUrl: String(input?.profileUrl || ""),
+    accountType: String(input?.accountType || "欧洲"),
+    active: input?.active !== false,
+  }))
+  .handler(({ data }) => createAccountRecord(data));
+
+export const setManagedAccountActive = createServerFn({ method: "POST" })
+  .validator((input: any) => ({
+    accountId: String(input?.accountId || ""),
+    active: input?.active === true,
+  }))
+  .handler(({ data }) => setAccountActiveRecord(data.accountId, data.active));

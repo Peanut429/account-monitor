@@ -8,7 +8,8 @@
     "login": "node --experimental-strip-types src/jobs/login.ts",
     "monitor": "node --experimental-strip-types src/jobs/monitor.ts",
     "web:dev": "pnpm --dir web dev",
-    "web:build": "pnpm --dir web build"
+    "web:build": "pnpm --dir web build",
+    "web:start": "pnpm --dir web start"
   },
   "dependencies": {
     "pg": "^8.22.0",

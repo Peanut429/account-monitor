@@ -78,13 +78,6 @@ function AccountLayout() {
         </div>
       </div>
 
-      {account.lastRunStatus === "failed" ? (
-        <div className="banner banner-error">
-          最近一次抓取失败：{account.lastRunErrorCode || "SCRAPE_FAILED"}
-          {account.lastRunErrorMessage ? ` · ${account.lastRunErrorMessage}` : ""}
-        </div>
-      ) : null}
-
       <Outlet />
     </div>
   );

@@ -1,0 +1,18 @@
+[Unit]
+Description=Changan Monitor Web (TanStack Start / Nitro)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=changan
+Group=changan
+WorkingDirectory=/opt/changan-monitor/web
+ExecStart=/usr/bin/node --env-file=.env server/index.mjs
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
