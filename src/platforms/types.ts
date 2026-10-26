@@ -55,6 +55,8 @@ export type ScrapeContext = {
   sinceTsMs: number;
   untilTsMs: number;
   log: ScrapeLog;
+  /** 同一轮内共享的接口模式（目前只有 LinkedIn 使用）。 */
+  mode?: string | null;
 };
 
 export type ScrapeResult = {
@@ -67,5 +69,7 @@ export type PlatformAdapter = {
   name: string;
   loginUrl: string;
   needsPage?: boolean;
+  /** 可选：一轮只探测一次，结果供本轮所有账号复用。 */
+  probeMode?(ctx: { page: Page; account: AccountRow; log: ScrapeLog }): Promise<string | null>;
   scrapeAccount(ctx: ScrapeContext): Promise<ScrapeResult>;
 };

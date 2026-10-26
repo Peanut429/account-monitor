@@ -122,20 +122,17 @@ async function readProfile(page: Page): Promise<{
   });
 }
 
-async function scrapeLinkedIn({
-  page,
-  account,
-  sinceTsMs,
-  untilTsMs,
-  log,
-}: ScrapeContext): Promise<ScrapeResult> {
-  if (!page) throw new Error("LinkedIn adapter 需要浏览器页面");
+async function readLinkedInCapture(page: Page): Promise<{ rsc: string; graphql: string[] }> {
+  return page.evaluate(() => {
+    const w = window as any;
+    return {
+      rsc: Array.isArray(w.__liRscBodies) ? w.__liRscBodies.join("\n") : "",
+      graphql: Array.isArray(w.__liGraphqlBodies) ? w.__liGraphqlBodies : [],
+    };
+  });
+}
 
-  const posts = new Map<string, PostRow>();
-  let sawCard = false;
-
-  await log("info", "open_profile", `打开 ${account.profileUrl}`, { pageUrl: account.profileUrl });
-
+async function installLinkedInCapture(page: Page): Promise<void> {
   // LinkedIn 新版公司动态是 RSC/sdui。DOM 上的点赞数经常不在 social-counts
   // 的按钮文案里，但 RSC 数据里有 ReactionType_* / commentCount / repostCount。
   // 在页面脚本执行前挂 fetch，把 RSC 响应 clone 下来，后面按 activityId 合并。
@@ -195,6 +192,25 @@ async function scrapeLinkedIn({
       };
     }
   });
+
+}
+
+async function scrapeLinkedIn({
+  page,
+  account,
+  sinceTsMs,
+  untilTsMs,
+  log,
+  mode,
+}: ScrapeContext): Promise<ScrapeResult> {
+  if (!page) throw new Error("LinkedIn adapter 需要浏览器页面");
+
+  const posts = new Map<string, PostRow>();
+  let sawCard = false;
+
+  await log("info", "open_profile", `打开 ${account.profileUrl}`, { pageUrl: account.profileUrl });
+
+  await installLinkedInCapture(page);
 
   const navResponse = await page.goto(account.profileUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
   const docText = navResponse ? await navResponse.text().catch(() => "") : "";
@@ -258,13 +274,7 @@ async function scrapeLinkedIn({
   }
 
   // 合并 RSC 里的互动数；DOM 解析作为兜底。
-  const captured = await page.evaluate(() => {
-    const w = window as any;
-    return {
-      rsc: Array.isArray(w.__liRscBodies) ? w.__liRscBodies.join("\n") : "",
-      graphql: Array.isArray(w.__liGraphqlBodies) ? w.__liGraphqlBodies : [],
-    };
-  });
+  const captured = await readLinkedInCapture(page);
 
   const rscById = new Map(
     parseRscFeed(`${docText}\n${captured.rsc}`, [...posts.keys()]).map((row) => [row.activityId, row]),
@@ -287,8 +297,8 @@ async function scrapeLinkedIn({
   }
 
   const rscActivityIds = activityIdsFromRsc(`${docText}\n${captured.rsc}`).length;
-  const interfaceMode = rscActivityIds > 0 ? "rsc" : graphqlById.size > 0 ? "graphql" : "dom";
-  await log("info", "interface_mode", `LinkedIn 接口探测：${interfaceMode}`, {
+  const interfaceMode = mode || (rscActivityIds > 0 ? "rsc" : graphqlById.size > 0 ? "graphql" : "dom");
+  await log("info", "interface_mode", mode ? `LinkedIn 复用本轮探测：${mode}` : `LinkedIn 接口探测：${interfaceMode}`, {
     rscActivityIds,
     graphqlPosts: graphqlById.size,
     posts: posts.size,
@@ -326,9 +336,37 @@ async function scrapeLinkedIn({
   };
 }
 
+/** 只用一次：探测本轮 LinkedIn 公司主页走 RSC 还是 GraphQL。 */
+export async function detectLinkedInMode(
+  page: Page,
+  account: { profileUrl: string },
+): Promise<"rsc" | "graphql" | "dom"> {
+  await installLinkedInCapture(page);
+  const navResponse = await page.goto(account.profileUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
+  const docText = navResponse ? await navResponse.text().catch(() => "") : "";
+  await page.waitForTimeout(4_000);
+  for (let round = 0; round < 4; round += 1) {
+    await page.evaluate(() => window.scrollBy(0, Math.max(900, window.innerHeight * 1.7)));
+    await page.waitForTimeout(1_200);
+  }
+  const captured = await readLinkedInCapture(page);
+  const rscText = `${docText}\n${captured.rsc}`;
+  const rscActivityIds = activityIdsFromRsc(rscText).length;
+  let graphqlPosts = 0;
+  for (const text of captured.graphql) {
+    try {
+      graphqlPosts += parseLinkedInGraphqlCounts(JSON.parse(text)).size;
+    } catch {
+      // ignore
+    }
+  }
+  return rscActivityIds > 0 ? "rsc" : graphqlPosts > 0 ? "graphql" : "dom";
+}
+
 export const linkedinAdapter: PlatformAdapter = {
   code: "linkedin",
   name: "LinkedIn",
   loginUrl: "https://www.linkedin.com/feed/",
+  probeMode: async ({ page, account }) => detectLinkedInMode(page, account),
   scrapeAccount: scrapeLinkedIn,
 };
