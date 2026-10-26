@@ -41,6 +41,8 @@ export function parseCount(value: unknown): number | null {
 export function errorCodeForMessage(message: unknown): string {
   const text = String(message || "");
   if (/login|登录|sign in|未登录|authenticate/i.test(text)) return "LOGIN_REQUIRED";
+  if (/FACEBOOK_FIRST_SCREEN_TIMEOUT/i.test(text)) return "FACEBOOK_FIRST_SCREEN_TIMEOUT";
+  if (/FACEBOOK_FIRST_SCREEN_PARSE_EMPTY/i.test(text)) return "FACEBOOK_FIRST_SCREEN_PARSE_EMPTY";
   if (/timeout|超时/i.test(text)) return "TIMEOUT";
   if (/没有.*adapter|尚未实现|not implemented/i.test(text)) return "NO_ADAPTER";
   return "SCRAPE_FAILED";
