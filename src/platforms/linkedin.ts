@@ -9,6 +9,14 @@ function maxCount(...values: Array<number | null | undefined>): number | null {
   return nums.length ? Math.max(...nums) : null;
 }
 
+type LinkedInMode = "rsc" | "graphql" | "dom";
+let cachedLinkedInMode: LinkedInMode | null = null;
+
+/** 每个 monitor 周期开头重置，保证一轮只判定一次。 */
+export function resetLinkedInMode(): void {
+  cachedLinkedInMode = null;
+}
+
 type LinkedInCard = {
   activityId: string;
   text: string;
@@ -201,7 +209,6 @@ async function scrapeLinkedIn({
   sinceTsMs,
   untilTsMs,
   log,
-  mode,
 }: ScrapeContext): Promise<ScrapeResult> {
   if (!page) throw new Error("LinkedIn adapter 需要浏览器页面");
 
@@ -297,8 +304,11 @@ async function scrapeLinkedIn({
   }
 
   const rscActivityIds = activityIdsFromRsc(`${docText}\n${captured.rsc}`).length;
-  const interfaceMode = mode || (rscActivityIds > 0 ? "rsc" : graphqlById.size > 0 ? "graphql" : "dom");
-  await log("info", "interface_mode", mode ? `LinkedIn 复用本轮探测：${mode}` : `LinkedIn 接口探测：${interfaceMode}`, {
+  const detectedMode = rscActivityIds > 0 ? "rsc" : graphqlById.size > 0 ? "graphql" : "dom";
+  const reused = cachedLinkedInMode != null;
+  const interfaceMode = cachedLinkedInMode ?? detectedMode;
+  cachedLinkedInMode = interfaceMode;
+  await log("info", "interface_mode", reused ? `LinkedIn 复用本轮探测：${interfaceMode}` : `LinkedIn 接口探测：${interfaceMode}`, {
     rscActivityIds,
     graphqlPosts: graphqlById.size,
     posts: posts.size,
@@ -336,37 +346,9 @@ async function scrapeLinkedIn({
   };
 }
 
-/** 只用一次：探测本轮 LinkedIn 公司主页走 RSC 还是 GraphQL。 */
-export async function detectLinkedInMode(
-  page: Page,
-  account: { profileUrl: string },
-): Promise<"rsc" | "graphql" | "dom"> {
-  await installLinkedInCapture(page);
-  const navResponse = await page.goto(account.profileUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
-  const docText = navResponse ? await navResponse.text().catch(() => "") : "";
-  await page.waitForTimeout(4_000);
-  for (let round = 0; round < 4; round += 1) {
-    await page.evaluate(() => window.scrollBy(0, Math.max(900, window.innerHeight * 1.7)));
-    await page.waitForTimeout(1_200);
-  }
-  const captured = await readLinkedInCapture(page);
-  const rscText = `${docText}\n${captured.rsc}`;
-  const rscActivityIds = activityIdsFromRsc(rscText).length;
-  let graphqlPosts = 0;
-  for (const text of captured.graphql) {
-    try {
-      graphqlPosts += parseLinkedInGraphqlCounts(JSON.parse(text)).size;
-    } catch {
-      // ignore
-    }
-  }
-  return rscActivityIds > 0 ? "rsc" : graphqlPosts > 0 ? "graphql" : "dom";
-}
-
 export const linkedinAdapter: PlatformAdapter = {
   code: "linkedin",
   name: "LinkedIn",
   loginUrl: "https://www.linkedin.com/feed/",
-  probeMode: async ({ page, account }) => detectLinkedInMode(page, account),
   scrapeAccount: scrapeLinkedIn,
 };

@@ -15,6 +15,7 @@ import {
   writeLog,
 } from "../db/repo.ts";
 import { getAdapter } from "../platforms/registry.ts";
+import { resetLinkedInMode } from "../platforms/linkedin.ts";
 import type { AccountRow } from "../platforms/types.ts";
 
 function parseArgs(argv: string[]): Record<string, string> {
@@ -88,13 +89,13 @@ async function main(): Promise<void> {
   const untilTsMs = Date.now();
   const sinceTsMs = untilTsMs - windowHours * 3_600_000;
 
+  resetLinkedInMode();
   let locked = false;
   let cycleId: string | null = null;
   let context: BrowserContext | null = null;
   let browserError: string | null = null;
   let accounts: AccountRow[] = [];
   let failed = 0;
-  let linkedinMode: string | null = null;
 
   try {
     locked = await tryAcquireCycleLock();
@@ -151,47 +152,7 @@ async function main(): Promise<void> {
       }
     }
 
-    // LinkedIn 接口模式一个周期只探测一次，后续账号复用；探测失败时各账号自己兜底判定。
-    const linkedinAccount = accounts.find((account) => account.platformCode === "linkedin");
-    if (context && linkedinAccount) {
-      const adapter = getAdapter("linkedin");
-      if (adapter?.probeMode) {
-        const probePage = await context.newPage();
-        probePage.setDefaultTimeout(45_000);
-        try {
-          linkedinMode = await withTimeout(
-            adapter.probeMode({
-              page: probePage,
-              account: linkedinAccount,
-              log: async (level, step, message, extra) => {
-                await writeLog({ cycleId: cycleId as string, level, step: `probe_${step}`, message, extra });
-              },
-            }),
-            120_000,
-            "LinkedIn 接口模式探测",
-          );
-          await writeLog({
-            cycleId: cycleId as string,
-            level: "info",
-            step: "linkedin_mode",
-            message: `本轮 LinkedIn 接口模式：${linkedinMode || "未判定"}`,
-            extra: { context: { account: linkedinAccount.handle, mode: linkedinMode } },
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          await writeLog({
-            cycleId: cycleId as string,
-            level: "warn",
-            step: "linkedin_mode_failed",
-            message: `LinkedIn 接口模式探测失败，账号将各自兜底：${message}`,
-          });
-        } finally {
-          await probePage.close().catch(() => {});
-        }
-      }
-    }
-
-    await mapLimit(accounts, concurrency, async (account) => {
+    const runAccount = async (account: AccountRow): Promise<void> => {
       const runId = await createRun(cycleId as string, account);
       const startedTsMs = Date.now();
       let page: Page | null = null;
@@ -216,7 +177,6 @@ async function main(): Promise<void> {
             account,
             sinceTsMs,
             untilTsMs,
-            mode: account.platformCode === "linkedin" ? linkedinMode : undefined,
             log: async (level, step, message, extra) => {
               await writeLog({
                 cycleId,
@@ -277,7 +237,9 @@ async function main(): Promise<void> {
       } finally {
         await page?.close().catch(() => {});
       }
-    });
+    };
+
+    await mapLimit(accounts, concurrency, runAccount);
 
     const status = failed === 0 ? "success" : failed === accounts.length ? "failed" : "partial_failed";
     await finishCycle({ cycleId, status });

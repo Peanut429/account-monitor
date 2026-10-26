@@ -84,7 +84,7 @@ pnpm run monitor --platform tiktok --limit 1
 |---|---|---|
 | `SYNC_ACCOUNT_TYPE` | `欧洲` | `db:sync-accounts` 从参考库导入哪类账号；不影响监控 |
 | `MONITOR_WINDOW_HOURS` | `72` | 窗口小时数 |
-| `MONITOR_CONCURRENCY` | `3` | 同时抓几个账号 |
+| `MONITOR_CONCURRENCY` | `3` | 并发账号数 |
 | `MONITOR_ACCOUNT_TIMEOUT_MS` | `300000` | 单账号超时 |
 | `MONITOR_HEADLESS` | `0` | 0=有头浏览器，1=无头 |
 | `MONITOR_USER_DATA_DIR` | `work/playwright-profile` | 浏览器 profile |
