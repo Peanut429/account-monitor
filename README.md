@@ -13,6 +13,7 @@
 pnpm install
 pnpm run db:init            # 建库 + 建表
 pnpm run db:sync-accounts   # 从参考库同步 account_type=欧洲 的账号
+pnpm run db:backfill-linkedin  # 用 raw_json 回填 LinkedIn 历史点赞/评论/转发
 pnpm run login --platform all   # 只有 Facebook / LinkedIn 需要登录
 pnpm run monitor            # 跑一轮全部账号
 pnpm run monitor --platform x --limit 1

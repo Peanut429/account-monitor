@@ -9,7 +9,8 @@
     "monitor": "node --experimental-strip-types src/jobs/monitor.ts",
     "web:dev": "pnpm --dir web dev",
     "web:build": "pnpm --dir web build",
-    "web:start": "pnpm --dir web start"
+    "web:start": "pnpm --dir web start",
+    "db:backfill-linkedin": "node --experimental-strip-types scripts/backfill-linkedin-metrics.ts"
   },
   "dependencies": {
     "pg": "^8.22.0",
