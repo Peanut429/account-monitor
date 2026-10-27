@@ -25,6 +25,22 @@
 | owner 过滤 | 参考项目也没有强过滤 | 无差异 |
 | checkpoint / Excel / CLI | 本项目不需要 | 不适用 |
 
+### Facebook 的两类 UFI 结构（账号维度，长期并存）
+
+同一份主页 feed，按账号返回两套结构，两种都要解析，**不是等 Facebook 修好的临时兼容**：
+
+| | classic（能看播放量） | adaptive（看不到播放量） |
+|---|---|---|
+| renderer `__typename` | `DefaultCometUFISummaryAndActionsRenderer` | `DefaultModernCometUFISummaryAndActionsRenderer` |
+| 赞/评论/转发 | 直接挂在 summary feedback 上 | 在 `adaptive_ufi_action_renderers[]` 里按 `__typename` 分辨 |
+| 播放量 | `video_view_count_renderer.feedback.play_count` | **整份响应没有播放量字段**（`story.view_count` 恒为 null） |
+| 目前覆盖账号 | 自己的账号 | 其余账号 |
+
+- 解析顺序：先取 classic 的扁平字段，取不到再取 adaptive。classic 里 `adaptive_ufi_action_renderers` 也存在，但 feedback 只有 `id` 没有计数，所以不会读到错值。
+- adaptive 类型 `post_metrics.views` 固定为 `null`，不写 0；`raw_json.ufiFormat` 记录该帖属于哪一类，日志 `parsed` 会输出两类各多少条。
+- `media.loop_count` 是预览循环次数，不是播放量。
+- 回归方式：`pnpm run fb:parse <抓包文件>`，stdout 会打印每条帖子的赞/评/转/播放和结构类型。
+
 ## LinkedIn
 
 参考入口：`linkedin-auto.ts` -> `linkedin-network.ts` / `linkedin-rsc.ts`
@@ -52,9 +68,11 @@
 - LinkedIn 的 `次展示` 不再写入 `reads`，也不写 `likes`；语义未确认，只保留在 `raw_json`。
 - LinkedIn 历史点赞无法从旧 `raw_json` 回填。
 - 历史 68 条 LinkedIn `reads` 已清空。
+- Facebook adaptive 类型账号没有播放量来源，`views` 写 `null`，报表上会和“0 播放”区分开。
 
 ## 验证状态
 
 - Facebook：语法检查、adapter import 通过；本地未登录，未做真实账号回归。
+- Facebook fixture 回归（`pnpm run fb:parse`）：adaptive 抓包 3 条帖子，赞/评/转 = 8/0/0、118/1/1、140/1/1，播放量为空；classic 抓包 229 条帖子，reel 播放量 12231 / 1233437 / 15073 与改动前一致。
 - LinkedIn：GraphQL fixture 10 条、RSC fixture 10 条解析通过；本地未登录，未做真实账号回归。
 - 代码层面的参考项目差异已按上表处理；真实登录态仍需在 Windows 服务器回归。

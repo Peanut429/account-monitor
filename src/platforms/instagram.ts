@@ -34,7 +34,8 @@ function itemMetrics(item: any): IgMetrics {
       ?? item?.edge_media_to_parent_comment?.count
       ?? item?.edge_media_to_comment?.count,
     ),
-    shares: parseCount(item?.media_repost_count ?? item?.reshare_count ?? item?.share_count),
+    // 只记录明确的 media_repost_count；拿不到就是 null，不用别的字段猜。
+    shares: parseCount(item?.media_repost_count),
     saves: parseCount(item?.save_count),
   };
 }
@@ -185,7 +186,8 @@ async function fetchPostMetricsFallback(code: string, url: string): Promise<IgMe
         views: parseCount(metrics.play_count),
         likes: parseCount(metrics.like_count),
         comments: parseCount(metrics.comment_count),
-        shares: parseCount(metrics.repost_count),
+        // 详情兜底也只用 media_repost_count，缺失就保持 null。
+        shares: parseCount(metrics.media_repost_count),
         saves: parseCount(metrics.save_count),
       };
     }
@@ -208,7 +210,7 @@ async function fetchPostMetricsFallback(code: string, url: string): Promise<IgMe
         ?? data.edge_media_to_comment?.count
         ?? data.comment_count,
       ),
-      shares: parseCount(data.reshare_count),
+      shares: parseCount(data.media_repost_count),
       saves: parseCount(data.save_count),
     };
   } catch {
@@ -255,9 +257,13 @@ async function scrapeInstagram({
             views: metrics.views,
             likes: metrics.likes,
             comments: metrics.comments,
-            shares: metrics.shares,
-            saves: metrics.saves,
+            shares: metrics.shares ?? post.metrics.shares,
+            saves: metrics.saves ?? post.metrics.saves,
             reads: null,
+          },
+          raw: {
+            ...(post.raw as Record<string, unknown> || {}),
+            fallback_metrics: metrics,
           },
         };
         fallbackCount += 1;

@@ -14,6 +14,8 @@ type NetworkPost = {
   commentText: string;
   shareText: string;
   playText: string;
+  /** 该帖的 UFI 结构类型，见 extractUfiCounts：classic | adaptive | dom | none */
+  ufiFormat: string;
   ownerHandle: string;
   ownerUrl: string;
   ownerUrls: string[];
@@ -141,6 +143,75 @@ function collectStoryObjects(parsed: any): any[] {
   return out;
 }
 
+function pickCount(...values: unknown[]): unknown {
+  for (const value of values) if (value != null) return value;
+  return undefined;
+}
+
+function adaptiveRendererFeedback(feedback: any, typename: string): any {
+  const renderers = Array.isArray(feedback?.adaptive_ufi_action_renderers)
+    ? feedback.adaptive_ufi_action_renderers
+    : [];
+  for (const renderer of renderers) {
+    if (String(renderer?.__typename || "") === typename) return renderer?.feedback ?? null;
+  }
+  return null;
+}
+
+/**
+ * 主页 feed 有两类返回结构，是账号维度上的长期差异（目前只有自己的账号能看到播放量，
+ * 其他账号一律返回另一套），所以两类要同时解析，不是等 Facebook 修好的临时兼容。
+ *
+ * - classic：`DefaultCometUFISummaryAndActionsRenderer`
+ *   赞/评论/转发直接挂在 summary feedback 上，播放量在
+ *   `video_view_count_renderer.feedback.play_count`。
+ * - adaptive：`DefaultModernCometUFISummaryAndActionsRenderer`
+ *   计数搬进 `adaptive_ufi_action_renderers[]`，按 __typename 分辨赞/评论/转发；
+ *   这一类整份响应里没有播放量字段（`story.view_count` 恒为 null），views 只能是 null。
+ *   注意 `media.loop_count` 是预览循环次数，不是播放量，别当兜底。
+ *
+ * classic 里 adaptive_ufi_action_renderers 也在，但 feedback 只有 id、没有计数，
+ * 所以按 classic → adaptive 的顺序取值不会读到错值。
+ */
+function extractUfiCounts(feedback: any, targetWithContext: any): {
+  likeText: string;
+  commentText: string;
+  shareText: string;
+  /** 只有 classic 类型拿得到，adaptive 类型恒为空串 */
+  playText: string;
+  ufiFormat: string;
+} {
+  const flatLike = feedback?.reaction_count?.count
+    ?? feedback?.if_viewer_cannot_see_seen_by_member_list?.reaction_count?.count;
+  const flatComment = feedback?.comments_count_summary_renderer?.feedback
+    ?.comment_rendering_instance?.comments?.total_count;
+  const flatShare = feedback?.share_count?.count;
+  const flatPlay = feedback?.video_view_count_renderer?.feedback?.play_count;
+
+  const reactFeedback = adaptiveRendererFeedback(feedback, "UFIStoryReactActionRenderer");
+  const commentFeedback = adaptiveRendererFeedback(feedback, "UFICommentActionRenderer");
+  const shareFeedback = adaptiveRendererFeedback(feedback, "XFBUFIAdaptiveShareActionRenderer");
+
+  const like = pickCount(flatLike, reactFeedback?.reaction_count?.count);
+  const comment = pickCount(
+    flatComment,
+    commentFeedback?.comment_rendering_instance?.comments?.total_count,
+    targetWithContext?.comment_rendering_instance?.comments?.total_count,
+  );
+  const share = pickCount(flatShare, shareFeedback?.share_count?.count);
+
+  const usedClassic = flatLike != null || flatComment != null || flatShare != null;
+  const ufiFormat = usedClassic ? "classic" : like != null || comment != null || share != null ? "adaptive" : "none";
+
+  return {
+    likeText: String(like ?? ""),
+    commentText: String(comment ?? ""),
+    shareText: String(share ?? ""),
+    playText: String(flatPlay ?? ""),
+    ufiFormat,
+  };
+}
+
 function extractPost(story: any): NetworkPost | null {
   const content = story?.comet_sections?.content?.story;
   const publishSeconds = Number(
@@ -150,9 +221,10 @@ function extractPost(story: any): NetworkPost | null {
   const url = normalizeContentUrl(content?.wwwURL || content?.url);
   if (!Number.isFinite(publishSeconds) || publishSeconds <= 0 || !url) return null;
 
-  const feedback = story?.comet_sections?.feedback?.story?.story_ufi_container?.story
-    ?.feedback_context?.feedback_target_with_context
-    ?.comet_ufi_summary_and_actions_renderer?.feedback;
+  const targetWithContext = story?.comet_sections?.feedback?.story?.story_ufi_container?.story
+    ?.feedback_context?.feedback_target_with_context;
+  const feedback = targetWithContext?.comet_ufi_summary_and_actions_renderer?.feedback;
+  const counts = extractUfiCounts(feedback, targetWithContext);
 
   const actors = Array.isArray(content?.actors) ? content.actors : [];
   const ownerUrls = actors
@@ -164,18 +236,11 @@ function extractPost(story: any): NetworkPost | null {
     postId: String(content?.post_id || pickPostId(url)),
     publishTsMs: publishSeconds * 1000,
     excerpt: String(content?.message?.text || ""),
-    likeText: String(
-      feedback?.reaction_count?.count
-      ?? feedback?.if_viewer_cannot_see_seen_by_member_list?.reaction_count?.count
-      ?? "",
-    ),
-    commentText: String(
-      feedback?.comments_count_summary_renderer?.feedback?.comment_rendering_instance
-        ?.comments?.total_count
-      ?? "",
-    ),
-    shareText: String(feedback?.share_count?.count ?? ""),
-    playText: String(feedback?.video_view_count_renderer?.feedback?.play_count ?? ""),
+    likeText: counts.likeText,
+    commentText: counts.commentText,
+    shareText: counts.shareText,
+    playText: counts.playText,
+    ufiFormat: counts.ufiFormat,
     ownerHandle: normalizeHandle(accountFromUrl(ownerUrls[0] || "")),
     ownerUrl: ownerUrls[0] || "",
     ownerUrls,
@@ -241,6 +306,7 @@ function domToNetworkPost(dom: DomPost, accountHandle: string): NetworkPost | nu
     commentText: dom.commentText,
     shareText: dom.shareText,
     playText: dom.playText,
+    ufiFormat: "dom",
     ownerHandle: normalizeHandle(accountHandle),
     ownerUrl: "",
     ownerUrls: [],
@@ -349,6 +415,7 @@ function createNetworkCollector(page: Page) {
       commentText: row.commentText || current.commentText,
       shareText: row.shareText || current.shareText,
       playText: row.playText || current.playText,
+      ufiFormat: row.ufiFormat !== "none" ? row.ufiFormat : current.ufiFormat,
       ownerUrls: [...new Set([...current.ownerUrls, ...row.ownerUrls])],
     });
   }
@@ -680,6 +747,7 @@ async function scrapeFacebook({
 
     const profile = await collectProfile(page);
     const posts = new Map<string, PostRow>();
+    const formats = new Map<string, number>();
     for (const post of selected) {
       const externalId = post.postId || post.url;
       if (posts.has(externalId)) continue;
@@ -712,14 +780,25 @@ async function scrapeFacebook({
           commentText: post.commentText,
           shareText: post.shareText,
           playText: post.playText,
+          ufiFormat: post.ufiFormat,
         },
       });
+      formats.set(post.ufiFormat, (formats.get(post.ufiFormat) || 0) + 1);
     }
 
-    await log("info", "parsed", `窗口内 ${posts.size} 条帖子（接口响应 ${stats.responses}，Story ${stats.stories}）`, {
-      pageUrl: page.url(),
-      context: { ...stats, selected: posts.size },
-    });
+    const rows = [...posts.values()];
+    const playMissing = rows.filter((post) => post.metrics.views == null).length;
+    const formatText = [...formats].map(([key, value]) => `${key}=${value}`).join(" ") || "none";
+    await log(
+      "info",
+      "parsed",
+      `窗口内 ${rows.length} 条帖子（接口响应 ${stats.responses}，Story ${stats.stories}，`
+      + `结构 ${formatText}，无播放量 ${playMissing}）`,
+      {
+        pageUrl: page.url(),
+        context: { ...stats, selected: rows.length, playMissing, ufiFormats: Object.fromEntries(formats) },
+      },
+    );
 
     return {
       accountMetrics: {
@@ -741,3 +820,6 @@ export const facebookAdapter: PlatformAdapter = {
   loginUrl: "https://www.facebook.com/",
   scrapeAccount: scrapeFacebook,
 };
+
+// 仅供 scripts/probe-facebook-parse.ts 做抓包 fixture 回归，生产路径只走 scrapeFacebook。
+export { collectStoryObjects, extractPost, parseJsonLine };
