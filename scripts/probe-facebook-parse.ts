@@ -14,8 +14,34 @@
  * 退出码 1 表示一条帖子都没解析出来（说明结构又变了，需要重新对照）。
  */
 import { readFileSync } from "node:fs";
-import { collectStoryObjects, extractPost, parseJsonLine } from "../src/platforms/facebook.ts";
+import { collectStoryObjects, extractPost, parseJsonLine, readDomPosts } from "../src/platforms/facebook.ts";
 import { parseCount } from "../src/core/time.ts";
+
+/**
+ * readDomPosts 曾经漏过 return（`return posts` 写进了 page.evaluate 的回调），
+ * 结果恒为 undefined，随即在 domPosts.map 处抛错，整个 Facebook 账号每轮都失败。
+ * 这里用假 page 做一次断言，不需要登录态，跑 probe 就能守住这个坑。
+ */
+async function selfCheckReadDomPosts(): Promise<string | null> {
+  const sample = [{
+    url: "https://www.facebook.com/x/posts/1",
+    timeText: "1 天",
+    exactTimeText: "",
+    text: "sample",
+    type: "post",
+    isPinned: false,
+    playText: "",
+    likeText: "",
+    commentText: "",
+    shareText: "",
+  }];
+  const fakePage = (value: unknown) => ({ evaluate: async () => value });
+  const normal = await readDomPosts(fakePage(sample) as never);
+  if (!Array.isArray(normal) || normal.length !== 1) return `readDomPosts 正常路径返回 ${JSON.stringify(normal)}`;
+  const degraded = await readDomPosts(fakePage(undefined) as never);
+  if (!Array.isArray(degraded) || degraded.length !== 0) return `readDomPosts 兜底路径返回 ${JSON.stringify(degraded)}`;
+  return null;
+}
 
 type Candidate = { postId: string; url: string; likeText: string; commentText: string; shareText: string; playText: string; ufiFormat: string; publishTsMs: number };
 
@@ -72,6 +98,9 @@ function show(value: string): string {
   return value ? `${value} (${count})` : "—";
 }
 
+const selfCheckError = await selfCheckReadDomPosts();
+console.log(selfCheckError ? `readDomPosts 自检失败：${selfCheckError}` : "readDomPosts 自检通过（返回数组，undefined 兜底为空数组）");
+
 const files = process.argv.slice(2);
 const targets = files.length ? files : ["response.jsonl"];
 let total = 0;
@@ -106,7 +135,7 @@ for (const file of targets) {
 }
 
 console.log(`\n合计解析出 ${total} 条帖子。`);
-if (!total) {
-  console.error("一条都没解析出来，Facebook 响应结构可能又变了。");
+if (!total || selfCheckError) {
+  if (!total) console.error("一条都没解析出来，Facebook 响应结构可能又变了。");
   process.exit(1);
 }

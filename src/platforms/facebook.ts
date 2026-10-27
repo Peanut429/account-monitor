@@ -388,6 +388,10 @@ async function readDomPosts(page: Page, enrichTooltips = false): Promise<DomPost
     }
     return posts;
   });
+  // 之前这里漏了 return：`return posts` 写在 page.evaluate 的回调里，函数本身返回 undefined，
+  // 于是每轮滚动都在 domPosts.map 处抛 "Cannot read properties of undefined (reading 'map')"。
+  // 另外页面若在求值过程中跳转也会拿到 undefined，一并兜底成空数组。
+  return Array.isArray(posts) ? posts : [];
 }
 
 function createNetworkCollector(page: Page) {
@@ -822,4 +826,4 @@ export const facebookAdapter: PlatformAdapter = {
 };
 
 // 仅供 scripts/probe-facebook-parse.ts 做抓包 fixture 回归，生产路径只走 scrapeFacebook。
-export { collectStoryObjects, extractPost, parseJsonLine };
+export { collectStoryObjects, extractPost, parseJsonLine, readDomPosts };
