@@ -86,6 +86,8 @@ pnpm run monitor --platform tiktok --limit 1
 | `MONITOR_WINDOW_HOURS` | `72` | 窗口小时数 |
 | `MONITOR_CONCURRENCY` | `3` | 并发账号数 |
 | `MONITOR_ACCOUNT_TIMEOUT_MS` | `300000` | 单账号超时 |
+| `FACEBOOK_FIRST_SCREEN_RETRIES` | `2` | Facebook 首屏卡死时重载次数，0 = 关闭 |
+| `FACEBOOK_FIRST_SCREEN_RETRY_BUDGET_MS` | `180000` | 首屏等待 + 重载的总预算 |
 | `MONITOR_HEADLESS` | `0` | 0=有头浏览器，1=无头 |
 | `MONITOR_USER_DATA_DIR` | `work/playwright-profile` | 浏览器 profile |
 | `TIKHUB_API_KEY` | 空 | X / YouTube / Instagram / TikTok 共用 |
@@ -164,6 +166,11 @@ order by a.platform_code, a.handle;
 - **TikTok**：TikHub 先解析 `sec_user_id`，再取用户资料和主页作品列表。
 - **系统代理**：API 平台只走 Node 直连 TikHub，不依赖 Chrome 代理；Facebook / LinkedIn 的浏览器仍然走系统代理。
 - **0 帖**：账号 72h 没发帖是正常成功，`posts_found=0`，不是失败。
+- **Facebook 首屏卡死**：主页右栏停在骨架屏、底部显示“用时超出预期”时，首屏一张帖子卡片都没有，滚动也拿不到帖子。adapter 会自动重载页面重试（默认 2 次，日志 `facebook_retry`），仍失败则报 `FACEBOOK_FIRST_SCREEN_TIMEOUT`；重试次数和预算见上面的 `FACEBOOK_FIRST_SCREEN_*`。离线回归：`pnpm run fb:retry`。
+- **LinkedIn 新版 sdui**：公司动态页已经没有 DOM 卡片，帖子来自首屏文档 + `flagship-web/rsc-action/actions/pagination`。滚动会一直抓到“最早帖子早于 72h”为止，日志 `pagination` 记录分页份数和最早时间。出现 0 帖时先看 `interface_mode` 的 `httpStatus / docBytes / rscActivityIds / paginationBodies`：
+  - `httpStatus=999` 或 `docBytes=0`：登录态失效或被风控，重新跑 `pnpm run login --platform linkedin`；
+  - 有 `paginationBodies` 但 `rscActivityIds=0`：多半是页面结构又改了，保存一份 probe 报告再改解析；
+  - 新版路径不产出正文，`text` 为空是已知限制。离线回归：`pnpm run li:pag`。
 - **周期重叠**：每小时一轮意味着每篇帖子最多 72 条快照；`post_metrics` 的唯一键是 `(run_id, post_id)`，不会重复。
 - **并发**：默认 3。LinkedIn/Facebook 如果触发风控，调小 `MONITOR_CONCURRENCY`。
 

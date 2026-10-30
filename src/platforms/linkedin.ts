@@ -1,7 +1,7 @@
-import type { Page, Response } from "playwright";
+import type { Page, Request, Response } from "playwright";
 import { parseCount } from "../core/time.ts";
 import type { PlatformAdapter, PostRow, ScrapeContext, ScrapeResult } from "./types.ts";
-import { activityIdsFromRsc, parseRscFeed } from "./linkedin-rsc-parser.ts";
+import { activityIdsFromRsc, parseRscFeed, publishIsoFromActivityId } from "./linkedin-rsc-parser.ts";
 import {
   parseLinkedInGraphqlCounts,
   parseLinkedInGraphqlPosts,
@@ -188,14 +188,11 @@ async function readProfile(page: Page): Promise<{
   });
 }
 
-async function readLinkedInCapture(page: Page): Promise<{ rsc: string; graphql: string[] }> {
+async function readLinkedInGraphqlBodies(page: Page): Promise<string[]> {
   return page.evaluate(() => {
     const w = window as any;
-    return {
-      rsc: Array.isArray(w.__liRscBodies) ? w.__liRscBodies.join("\n") : "",
-      graphql: Array.isArray(w.__liGraphqlBodies) ? w.__liGraphqlBodies : [],
-    };
-  });
+    return Array.isArray(w.__liGraphqlBodies) ? w.__liGraphqlBodies : [];
+  }).catch(() => []);
 }
 
 type LinkedInGraphqlCollector = {
@@ -241,35 +238,45 @@ function attachLinkedInGraphqlCollector(page: Page): LinkedInGraphqlCollector {
 }
 
 async function installLinkedInCapture(page: Page): Promise<void> {
-  // LinkedIn 新版公司动态是 RSC/sdui。DOM 上的点赞数经常不在 social-counts
-  // 的按钮文案里，但 RSC 数据里有 ReactionType_* / commentCount / repostCount。
-  // 在页面脚本执行前挂 fetch，把 RSC 响应 clone 下来，后面按 activityId 合并。
+  // LinkedIn 新版公司动态是 RSC/sdui：首屏数据随文档 SSR 下发，之后每页数据由
+  // POST /flagship-web/rsc-action/actions/pagination 返回（每份 2-6MB）。
+  // 必须在页面脚本执行前挂 fetch/XHR，clone 响应留一份；分页 body 由抓取端
+  // 每轮 drain 取走并清空，不能一直堆在页面侧，否则 renderer 内存会持续上涨。
+  // 注意：不能用 CDP 的 response.body()，会和页面自身的 fetch 抢 body，
+  // 报 "No data found for resource with given identifier"，整页帖子被静默丢弃。
   await page.addInitScript(() => {
     const w = window as any;
-    w.__liRscBodies = [];
+    w.__liPagBodies = [];
     w.__liGraphqlBodies = [];
+
+    const classify = (url: string): string | null => {
+      if (/rsc-action\/actions\/pagination/.test(url)) return "__liPagBodies";
+      if (/voyager\/api\/.*graphql/.test(url)) return "__liGraphqlBodies";
+      return null;
+    };
+    const store = (key: string, text: string): void => {
+      const target = w[key];
+      if (!Array.isArray(target)) return;
+      target.push(text);
+      const cap = key === "__liPagBodies" ? 8 : 30;
+      while (target.length > cap) target.shift();
+    };
+
     const originalFetch = w.fetch.bind(w);
     w.fetch = (...args: any[]) => {
       const input = args[0];
       const url = typeof input === "string" ? input : input?.url || String(input);
+      const key = classify(url);
       const promise = originalFetch(...args);
-      const target = /flagship-web\/(?:feed|rsc-action)/.test(url)
-        ? "__liRscBodies"
-        : /voyager\/api\/.*graphql/.test(url)
-          ? "__liGraphqlBodies"
-          : null;
-      if (target) {
+      if (key) {
         promise.then((response: any) => {
-          response.clone().text().then((text: string) => {
-            w[target].push(text);
-            if (w[target].length > 20) w[target].shift();
-          }).catch(() => {});
+          response.clone().text().then((text: string) => store(key, text)).catch(() => {});
         }).catch(() => {});
       }
       return promise;
     };
 
-    // 少量页面走 XHR，不只 fetch；同样捕获 GraphQL 响应。
+    // 少量请求走 XHR，不只 fetch；同样捕获。
     const XHR = w.XMLHttpRequest;
     if (XHR) {
       const originalOpen = XHR.prototype.open;
@@ -280,18 +287,11 @@ async function installLinkedInCapture(page: Page): Promise<void> {
       };
       XHR.prototype.send = function (this: any, ...args: any[]) {
         this.addEventListener("load", () => {
-          const requestUrl = String(this.__liRequestUrl || "");
-          const target = /flagship-web\/(?:feed|rsc-action)/.test(requestUrl)
-            ? "__liRscBodies"
-            : /voyager\/api\/.*graphql/.test(requestUrl)
-              ? "__liGraphqlBodies"
-              : null;
-          if (!target) return;
+          const key = classify(String(this.__liRequestUrl || ""));
+          if (!key) return;
           try {
             const text = this.responseText;
-            if (!text) return;
-            w[target].push(text);
-            if (w[target].length > 20) w[target].shift();
+            if (text) store(key, text);
           } catch {
             // ignore
           }
@@ -300,47 +300,6 @@ async function installLinkedInCapture(page: Page): Promise<void> {
       };
     }
   });
-
-}
-
-async function readApiPostTimes(
-  page: Page,
-  extraGraphqlBodies: unknown[] = [],
-  extraRscText = "",
-): Promise<Array<{ activityId: string; publishedTsMs: number }>> {
-  const captured = await readLinkedInCapture(page);
-  const out = new Map<string, number>();
-
-  const bodies: unknown[] = [...extraGraphqlBodies];
-  for (const text of captured.graphql) {
-    try {
-      bodies.push(JSON.parse(text));
-    } catch {
-      // ignore malformed body
-    }
-  }
-  for (const json of bodies) {
-    try {
-      for (const post of parseLinkedInGraphqlPosts(json).values()) {
-        if (post.publishedTsMs > 0) out.set(post.activityId, post.publishedTsMs);
-      }
-    } catch {
-      // ignore malformed body
-    }
-  }
-  try {
-    // 首屏文档（sdui SSR）和 fetch 猴补丁抓到的分页 RSC 一起参与边界判断。
-    const rscText = `${extraRscText}\n${captured.rsc}`;
-    const ids = activityIdsFromRsc(rscText);
-    for (const post of parseRscFeed(rscText, ids)) {
-      const ts = Date.parse(post.publishIso || "");
-      if (Number.isFinite(ts) && ts > 0) out.set(post.activityId, ts);
-    }
-  } catch {
-    // ignore
-  }
-
-  return [...out.entries()].map(([activityId, publishedTsMs]) => ({ activityId, publishedTsMs }));
 }
 
 async function ensureOnTargetCompanyPostsPage(page: Page, targetUrl: string): Promise<void> {
@@ -357,22 +316,33 @@ async function ensureOnTargetCompanyPostsPage(page: Page, targetUrl: string): Pr
   if (isExpected(page.url())) return;
   await page.waitForTimeout(1_200);
   if (isExpected(page.url())) return;
+  // LinkedIn 会把旧 slug 301 到新 slug（例如 byd-españa → byd-spain）。只要落地仍是
+  // 某个公司的「动态」页就继续抓，具体跳转由调用方写日志；登录页/首页仍然拒绝。
+  try {
+    const actual = new URL(page.url());
+    if (/linkedin\.com$/i.test(actual.hostname) && /^\/company\/[^/]+\/posts\/?$/i.test(actual.pathname)) return;
+  } catch {
+    // 非法 URL 走到下面抛错
+  }
   throw new Error(`LinkedIn 打开后未停留在目标公司动态页。目标=${targetUrl} 实际=${page.url() || "空白页"}`);
 }
 
-async function scrollLinkedInFeed(page: Page): Promise<void> {
-  await page.evaluate(() => {
+async function scrollLinkedInFeed(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
     const candidates = [...document.querySelectorAll("main, main *")]
       .filter((element) => element.scrollHeight > element.clientHeight + 100 && element.clientHeight > 100);
     const primary = candidates.sort((a, b) => b.scrollHeight - a.scrollHeight)[0];
-    if (primary) {
-      const maxTop = primary.scrollHeight - primary.clientHeight;
-      primary.scrollTop = Math.min(maxTop, primary.scrollTop + Math.max(400, Math.round(primary.clientHeight * 0.8)));
-      primary.dispatchEvent(new Event("scroll", { bubbles: true }));
-      return;
-    }
-    window.scrollBy(0, Math.max(900, window.innerHeight * 1.7));
-  });
+    if (!primary) return false;
+    const maxTop = primary.scrollHeight - primary.clientHeight;
+    const before = primary.scrollTop;
+    // 步长小一点（约 0.35 屏），一屏分几步滚；一次跳太多会触发懒加载 catch-up，
+    // LinkedIn 会直接跳过中间几页，导致漏帖。
+    const step = Math.max(200, Math.round(primary.clientHeight * 0.35));
+    primary.scrollTop = Math.min(maxTop, primary.scrollTop + step);
+    primary.dispatchEvent(new Event("scroll", { bubbles: true }));
+    primary.dispatchEvent(new WheelEvent("wheel", { deltaY: 200, bubbles: true }));
+    return primary.scrollTop !== before;
+  }).catch(() => false);
 }
 
 async function ensureSortRecent(page: Page): Promise<boolean> {
@@ -381,24 +351,147 @@ async function ensureSortRecent(page: Page): Promise<boolean> {
   const fallback = page.locator('[role="button"]').filter({ hasText: /^排序条件|^Sort by/ }).first();
   const trigger = (await direct.count().catch(() => 0)) ? direct : fallback;
   if (!(await trigger.count().catch(() => 0))) return false;
+  // sdui 首屏渲染比文档晚，排序控件晚一点出现是常态，等一会儿再判定。
+  await trigger.waitFor({ state: "visible", timeout: 8_000 }).catch(() => {});
 
   const label = (await trigger.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
   if (/最新|最近|Recent/i.test(label)) return true;
 
-  await trigger.click({ force: true }).catch(() => {});
+  // sdui 下拉必须真实鼠标点击（DOM .click() 不触发），Playwright locator.click 可以。
+  await trigger.click().catch(() => {});
   await page.waitForTimeout(1_200);
   const options = page.locator('[role="option"], [role="menuitem"]');
+  await options.first().waitFor({ state: "visible", timeout: 5_000 }).catch(() => {});
   const count = await options.count().catch(() => 0);
   for (let index = 0; index < count; index += 1) {
     const option = options.nth(index);
     const text = (await option.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+    // 下拉里“切到最新”的文案是“最近搜索”，这里按 最近/最新 匹配。
     if (!/最近|最新|Recent/i.test(text)) continue;
-    await option.click({ force: true }).catch(() => {});
+    await option.click().catch(() => {});
     await page.waitForTimeout(3_000);
     return true;
   }
   await page.keyboard.press("Escape").catch(() => {});
   return false;
+}
+
+function minPublishMs(text: string): number {
+  let min = Number.POSITIVE_INFINITY;
+  if (!text) return min;
+  for (const activityId of activityIdsFromRsc(text)) {
+    const ts = Date.parse(publishIsoFromActivityId(activityId));
+    if (Number.isFinite(ts) && ts < min) min = ts;
+  }
+  return min;
+}
+
+async function waitForPaginationBody(page: Page, timeoutMs: number): Promise<boolean> {
+  try {
+    await page.waitForFunction(
+      () => {
+        const w = window as any;
+        return Array.isArray(w.__liPagBodies) ? w.__liPagBodies.length > 0 : false;
+      },
+      undefined,
+      { timeout: timeoutMs },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 取走页面侧已捕获的分页 body 并立即清空，避免 6MB × N 堆在 renderer 里。 */
+async function drainPaginationBodies(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const w = window as any;
+    const list = Array.isArray(w.__liPagBodies) ? w.__liPagBodies : [];
+    w.__liPagBodies = [];
+    return list;
+  }).catch(() => []);
+}
+
+/**
+ * 滚到「窗口起点」为止：每轮先小幅滚动直到页面发起新的 pagination 请求，
+ * 等它的响应被 fetch 猴补丁捕获后取走。停的条件是最早一条帖子早于 sinceTsMs，
+ * 或者滚到底 / 连续多轮没有新请求和新响应。
+ */
+// 仅供 scripts/probe-linkedin-pagination.ts 离线回归分页循环，生产路径只走 scrapeLinkedInInner。
+export async function collectPaginationBodies(page: Page, sinceTsMs: number, docText: string): Promise<string[]> {
+  const bodies: string[] = [];
+  let requestCount = 0;
+  const onRequest = (request: Request): void => {
+    if (/rsc-action\/actions\/pagination/.test(request.url())) requestCount += 1;
+  };
+  page.on("request", onRequest);
+
+  try {
+    // 首屏文档是“热门”排序（顺序不可靠，可能夹着很早的旧帖），不能拿它判断是否滚到窗口起点；
+    // 停止判断只看切到“最新”之后的 pagination 响应。
+    let earliest = Number.POSITIVE_INFINITY;
+    let noRequestStreak = 0;
+    let noResponseStreak = 0;
+
+    // 切“最新”时已经触发过一次 pagination（第一页），先把已捕获的 body 取走。
+    for (const body of await drainPaginationBodies(page)) {
+      bodies.push(body);
+      earliest = Math.min(earliest, minPublishMs(body));
+    }
+    if (Number.isFinite(earliest) && earliest < sinceTsMs) return bodies;
+
+    for (let round = 0; round < 300; round += 1) {
+      const requestsBefore = requestCount;
+      let sawNewRequest = false;
+      let reachedBottom = false;
+
+      for (let step = 0; step < 20; step += 1) {
+        if (requestCount > requestsBefore) {
+          sawNewRequest = true;
+          break;
+        }
+        const moved = await scrollLinkedInFeed(page);
+        await page.waitForTimeout(500);
+        if (requestCount > requestsBefore) {
+          sawNewRequest = true;
+          break;
+        }
+        if (!moved) {
+          reachedBottom = true;
+          break;
+        }
+      }
+
+      if (!sawNewRequest) {
+        noRequestStreak += 1;
+        if (reachedBottom && noRequestStreak >= 3) break;
+        if (noRequestStreak >= 8) break;
+        continue;
+      }
+      noRequestStreak = 0;
+
+      if (!(await waitForPaginationBody(page, 15_000))) {
+        noResponseStreak += 1;
+        if (noResponseStreak >= 3) break;
+        continue;
+      }
+      noResponseStreak = 0;
+
+      // 等 sdui 把这一页渲染出来，再取 body。
+      await page.waitForTimeout(2_000);
+      for (const body of await drainPaginationBodies(page)) {
+        bodies.push(body);
+        earliest = Math.min(earliest, minPublishMs(body));
+      }
+      if (Number.isFinite(earliest) && earliest < sinceTsMs) break;
+    }
+  } finally {
+    page.off("request", onRequest);
+  }
+
+  // 循环提前退出时，页面上可能还有没取走的分页响应。
+  bodies.push(...(await drainPaginationBodies(page)));
+  return bodies;
 }
 
 async function scrapeLinkedInInner({
@@ -410,123 +503,81 @@ async function scrapeLinkedInInner({
 }: ScrapeContext): Promise<ScrapeResult> {
   if (!page) throw new Error("LinkedIn adapter 需要浏览器页面");
 
-  const posts = new Map<string, PostRow>();
-  let sawCard = false;
-
   await log("info", "open_profile", `打开 ${account.profileUrl}`, { pageUrl: account.profileUrl });
 
   await installLinkedInCapture(page);
-  // 必须在 goto 之前挂，否则首屏的 feed GraphQL 响应会漏掉。
+  // GraphQL 收集器保留为老页面兜底；新版 sdui 页面不会返回公司帖子。
   const network = attachLinkedInGraphqlCollector(page);
 
   const navResponse = await page.goto(account.profileUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
-  // 新版 sdui 页面把公司动态随首屏文档 SSR 下发，不发 feed 请求，所以文档本身就是数据源。
+  const navStatus = navResponse?.status() ?? 0;
+  // 新版 sdui 页面把首屏公司动态随文档 SSR 下发，文档本身就是数据源。
   // 文档里多一层 `\"` 转义，反转义后才能正常抽出帖子编号和互动计数。
   const docText = navResponse ? (await navResponse.text().catch(() => "")).replace(/\\+"/g, "\"") : "";
-  await page.waitForTimeout(4_000);
+  await page.waitForTimeout(3_000);
 
   if (/\/login\b|\/authwall\b|\/checkpoint\b/i.test(page.url())) {
     throw new Error(`LinkedIn 未登录或需要验证：${account.profileUrl}`);
   }
   await ensureOnTargetCompanyPostsPage(page, account.profileUrl);
+  if (page.url() && page.url() !== account.profileUrl) {
+    await log("warn", "url_redirect", `LinkedIn 跳转到 ${page.url()}`, { pageUrl: page.url() });
+  }
 
   const sortedRecent = await ensureSortRecent(page);
   await log("info", "sort_recent", sortedRecent ? "LinkedIn 动态已确认/切换为最近" : "未找到 LinkedIn 排序控件，保持当前排序");
 
-  let staleRounds = 0;
-  let consecutiveBeforeRange = 0;
-  const boundarySeen = new Set<string>();
-  for (let round = 0; ; round += 1) {
-    const cards = await readCards(page);
-    if (cards.length) sawCard = true;
+  // 切到「最新」本身就会触发一次 pagination（新版第一页），之后滚动继续拿下一页。
+  // 停不停看「最早一条帖子是否早于 72h 窗口起点」，不再按滚动轮数猜。
+  const paginationBodies = await collectPaginationBodies(page, sinceTsMs, docText);
+  const earliestPublishMs = (paginationBodies.length ? paginationBodies : [docText])
+    .map((body) => minPublishMs(body))
+    .reduce((min, value) => Math.min(min, value), Number.POSITIVE_INFINITY);
+  await log(
+    "info",
+    "pagination",
+    `LinkedIn 分页响应 ${paginationBodies.length} 份，分页里最早帖子 `
+    + `${Number.isFinite(earliestPublishMs) ? new Date(earliestPublishMs).toISOString() : "无"}`,
+    {
+      pageUrl: page.url(),
+      context: {
+        paginationBodies: paginationBodies.length,
+        docBytes: docText.length,
+        earliestPublishMs: Number.isFinite(earliestPublishMs) ? earliestPublishMs : null,
+      },
+    },
+  );
 
-    let stopForBoundary = false;
-    for (const card of cards) {
-      const publishedTsMs = activityIdToTsMs(card.activityId);
-      if (publishedTsMs == null) continue;
-
-      // 与参考项目一致：连续 3 条早于窗口起点的帖子，停止继续滚动。
-      if (!boundarySeen.has(card.activityId)) {
-        boundarySeen.add(card.activityId);
-        if (publishedTsMs < sinceTsMs) consecutiveBeforeRange += 1;
-        else if (publishedTsMs >= untilTsMs) consecutiveBeforeRange = 0;
-        else consecutiveBeforeRange = 0;
-        if (consecutiveBeforeRange >= 3) {
-          await log("info", "linkedin_stop", `连续遇到 ${consecutiveBeforeRange} 条早于 72h 的帖子，停止滚动`, {
-            context: { round: round + 1, consecutiveBeforeRange },
-          });
-          stopForBoundary = true;
-          break;
-        }
+  const rscBodies = [docText, ...paginationBodies].filter((body) => body.trim().length > 0);
+  const activityIds: string[] = [];
+  const seenActivityIds = new Set<string>();
+  const rscById = new Map<string, ReturnType<typeof parseRscFeed>[number]>();
+  for (const body of rscBodies) {
+    const ids = activityIdsFromRsc(body);
+    for (const activityId of ids) {
+      if (seenActivityIds.has(activityId)) continue;
+      seenActivityIds.add(activityId);
+      activityIds.push(activityId);
+    }
+    for (const row of parseRscFeed(body, ids)) {
+      const prev = rscById.get(row.activityId);
+      if (!prev) {
+        rscById.set(row.activityId, row);
+        continue;
       }
-
-      if (publishedTsMs < sinceTsMs || publishedTsMs >= untilTsMs) continue;
-      if (posts.has(card.activityId)) continue;
-
-      const counts = parseLinkedInCounts(card.labels, card.countsText);
-
-      posts.set(card.activityId, {
-        externalId: card.activityId,
-        url: `https://www.linkedin.com/feed/update/urn:li:activity:${card.activityId}/`,
-        contentType: card.isVideo ? "video" : card.isImage ? "image" : "post",
-        publishedTsMs,
-        publishedPrecision: "second",
-        title: null,
-        text: card.text,
-        metrics: {
-          views: null,
-          likes: counts.likes,
-          comments: counts.comments,
-          shares: counts.shares,
-          saves: null,
-          reads: null,
-        },
-        raw: {
-          activityId: card.activityId,
-          text: card.text,
-          countsText: card.countsText,
-          labels: card.labels,
-        },
+      rscById.set(row.activityId, {
+        ...prev,
+        likeCount: maxCount(prev.likeCount, row.likeCount),
+        commentCount: maxCount(prev.commentCount, row.commentCount),
+        repostCount: maxCount(prev.repostCount, row.repostCount),
       });
     }
-
-    // API-only 帖子也可能先于 DOM 卡片出现，同样参与 72h 边界判断。
-    for (const api of await readApiPostTimes(page, network.bodies, docText)) {
-      if (boundarySeen.has(api.activityId)) continue;
-      boundarySeen.add(api.activityId);
-      if (api.publishedTsMs < sinceTsMs) consecutiveBeforeRange += 1;
-      else consecutiveBeforeRange = 0;
-      if (consecutiveBeforeRange >= 3) {
-        stopForBoundary = true;
-        await log("info", "linkedin_stop", `连续遇到 ${consecutiveBeforeRange} 条早于 72h 的帖子，停止滚动`, {
-          context: { round: round + 1, consecutiveBeforeRange, source: "api" },
-        });
-        break;
-      }
-    }
-
-    if (stopForBoundary) break;
-    const before = posts.size;
-    await scrollLinkedInFeed(page);
-    await page.waitForTimeout(1_800);
-    if (posts.size === before) staleRounds += 1;
-    else staleRounds = 0;
-    if (staleRounds >= 6) break;
   }
-
-  // 合并 API 里的帖子和互动数；DOM 解析作为兜底。
-  const captured = await readLinkedInCapture(page);
-  const rscText = `${docText}\n${captured.rsc}`;
-  const rscActivityIds = activityIdsFromRsc(rscText);
-  const rscById = new Map(
-    parseRscFeed(rscText, rscActivityIds).map((row) => [row.activityId, row]),
-  );
 
   const graphqlById = new Map<string, LinkedInGraphqlCounts>();
   const graphqlPostById = new Map<string, LinkedInGraphqlPost>();
-  // CDP 收到的 JSON body 已经解析过；猴补丁收到的是文本，这里统一成对象再解析。
   const graphqlBodies: unknown[] = [...network.bodies];
-  for (const text of captured.graphql) {
+  for (const text of await readLinkedInGraphqlBodies(page)) {
     try {
       graphqlBodies.push(JSON.parse(text));
     } catch {
@@ -546,7 +597,16 @@ async function scrapeLinkedInInner({
       for (const [activityId, post] of parseLinkedInGraphqlPosts(json)) {
         const prev = graphqlPostById.get(activityId);
         if (!prev || post.text.length > prev.text.length) {
-          graphqlPostById.set(activityId, { ...post, ...(prev ? { likes: maxCount(prev.likes, post.likes), comments: maxCount(prev.comments, post.comments), shares: maxCount(prev.shares, post.shares) } : {}) });
+          graphqlPostById.set(activityId, {
+            ...post,
+            ...(prev
+              ? {
+                likes: maxCount(prev.likes, post.likes),
+                comments: maxCount(prev.comments, post.comments),
+                shares: maxCount(prev.shares, post.shares),
+              }
+              : {}),
+          });
         }
       }
     } catch {
@@ -554,7 +614,33 @@ async function scrapeLinkedInInner({
     }
   }
 
-  // API 帖子补进 posts；DOM 已经有同 activityId 时只补正文/URL/指标。
+  const posts = new Map<string, PostRow>();
+
+  // 主来源：RSC 的 activityId + snowflake 时间 + 互动计数。
+  for (const rsc of rscById.values()) {
+    const publishedTsMs = Date.parse(rsc.publishIso || "");
+    if (!Number.isFinite(publishedTsMs) || publishedTsMs < sinceTsMs || publishedTsMs >= untilTsMs) continue;
+    posts.set(rsc.activityId, {
+      externalId: rsc.activityId,
+      url: rsc.url,
+      contentType: "post",
+      publishedTsMs,
+      publishedPrecision: "second",
+      title: null,
+      text: null,
+      metrics: {
+        views: null,
+        likes: rsc.likeCount,
+        comments: rsc.commentCount,
+        shares: rsc.repostCount,
+        saves: null,
+        reads: null,
+      },
+      raw: { source: "linkedin_rsc", postId: rsc.activityId, url: rsc.url },
+    });
+  }
+
+  // GraphQL（老页面兜底）：补帖子和正文。
   for (const api of graphqlPostById.values()) {
     if (api.publishedTsMs < sinceTsMs || api.publishedTsMs >= untilTsMs) continue;
     const current = posts.get(api.activityId);
@@ -584,48 +670,79 @@ async function scrapeLinkedInInner({
     }
   }
 
-  // RSC 帖子补进 posts；RSC 没有正文，正文仍以 DOM/GraphQL 为准。
-  for (const rsc of rscById.values()) {
-    const publishedTsMs = Date.parse(rsc.publishIso || "");
-    if (!Number.isFinite(publishedTsMs) || publishedTsMs < sinceTsMs || publishedTsMs >= untilTsMs) continue;
-    if (posts.has(rsc.activityId)) continue;
-    posts.set(rsc.activityId, {
-      externalId: rsc.activityId,
-      url: rsc.url,
-      contentType: "post",
+  // DOM 兜底：只对旧版卡片页生效；新版 sdui 页面没有 data-urn 卡片，通常为空。
+  const domCards = await readCards(page);
+  for (const card of domCards) {
+    const publishedTsMs = activityIdToTsMs(card.activityId);
+    if (publishedTsMs == null || publishedTsMs < sinceTsMs || publishedTsMs >= untilTsMs) continue;
+    const counts = parseLinkedInCounts(card.labels, card.countsText);
+    const current = posts.get(card.activityId);
+    if (current) {
+      if (!current.text && card.text) current.text = card.text;
+      current.metrics.likes = maxCount(current.metrics.likes, counts.likes);
+      current.metrics.comments = maxCount(current.metrics.comments, counts.comments);
+      current.metrics.shares = maxCount(current.metrics.shares, counts.shares);
+      continue;
+    }
+    posts.set(card.activityId, {
+      externalId: card.activityId,
+      url: `https://www.linkedin.com/feed/update/urn:li:activity:${card.activityId}/`,
+      contentType: card.isVideo ? "video" : card.isImage ? "image" : "post",
       publishedTsMs,
       publishedPrecision: "second",
       title: null,
-      text: null,
+      text: card.text,
       metrics: {
         views: null,
-        likes: rsc.likeCount,
-        comments: rsc.commentCount,
-        shares: rsc.repostCount,
+        likes: counts.likes,
+        comments: counts.comments,
+        shares: counts.shares,
         saves: null,
         reads: null,
       },
-      raw: { source: "linkedin_rsc", postId: rsc.activityId, url: rsc.url },
+      raw: {
+        activityId: card.activityId,
+        text: card.text,
+        countsText: card.countsText,
+        labels: card.labels,
+      },
     });
   }
 
-  const detectedMode = rscActivityIds.length > 0 ? "rsc" : (graphqlPostById.size > 0 || graphqlById.size > 0) ? "graphql" : "dom";
+  // API 计数优先于 DOM 计数，避免 DOM 文案里的数字污染指标。
+  for (const [activityId, counts] of graphqlById) {
+    const current = posts.get(activityId);
+    if (!current) continue;
+    current.metrics.likes = maxCount(current.metrics.likes, counts.likes);
+    current.metrics.comments = maxCount(current.metrics.comments, counts.comments);
+    current.metrics.shares = maxCount(current.metrics.shares, counts.shares);
+  }
+
+  const detectedMode = activityIds.length > 0 ? "rsc" : (graphqlPostById.size > 0 || graphqlById.size > 0) ? "graphql" : "dom";
   const reused = cachedLinkedInMode != null;
   const interfaceMode = cachedLinkedInMode ?? detectedMode;
   cachedLinkedInMode = interfaceMode;
-  await log("info", "interface_mode", reused ? `LinkedIn 复用本轮探测：${interfaceMode}` : `LinkedIn 接口探测：${interfaceMode}`, {
-    rscActivityIds: rscActivityIds.length,
-    graphqlPosts: graphqlPostById.size,
-    posts: posts.size,
-    // API 抓取诊断：下次再出问题，直接看这几个数就知道是没抓到响应、还是解析不出来。
-    apiResponses: network.stats.apiResponses,
-    apiBodies: network.stats.feedResponses,
-    rscBodies: captured.rsc.length,
-    apiSampleUrls: network.stats.sampleUrls,
+  await log("info", "interface_mode", reused ? `LinkedIn 复用本轮探测：${interfaceMode}` : `LinkedIn 接口探测：${detectedMode}`, {
+    pageUrl: page.url(),
+    context: {
+      rscActivityIds: activityIds.length,
+      rscBodies: rscBodies.length,
+      paginationBodies: paginationBodies.length,
+      docBytes: docText.length,
+      graphqlPosts: graphqlPostById.size,
+      graphqlCounts: graphqlById.size,
+      domCards: domCards.length,
+      posts: posts.size,
+      httpStatus: navStatus,
+      apiResponses: network.stats.apiResponses,
+      apiBodies: network.stats.feedResponses,
+      apiSampleUrls: network.stats.sampleUrls,
+    },
   });
 
-  if (!posts.size) {
-    const bodyText = await page.evaluate(() => document.body.innerText.slice(0, 2_000));
+  const parsedAny = activityIds.length > 0 || graphqlPostById.size > 0 || domCards.length > 0;
+  if (!parsedAny) {
+    const bodyText = await page.evaluate(() => (document.body?.innerText || "").slice(0, 2_000));
     if (/暂无企业快讯|还没有企业快讯|No company updates|No posts yet/i.test(bodyText)) {
       const profile = await readProfile(page);
       await log("info", "no_posts", "LinkedIn 页面显示暂无企业快讯", { pageUrl: page.url() });
@@ -639,27 +756,18 @@ async function scrapeLinkedInInner({
         posts: [],
       };
     }
-    if (/sign in|join now|登录/i.test(bodyText)) {
+    if (/sign in|join now|加入领英|Join LinkedIn|登录/i.test(bodyText)) {
       throw new Error(`LinkedIn 未登录或需要验证：${account.profileUrl}`);
+    }
+    if (navStatus === 999) {
+      throw new Error(`LinkedIn 返回 HTTP 999（被风控或登录态失效，请重新登录）：${account.profileUrl}`);
     }
     throw new Error(`LinkedIn 没有解析到主页帖子，可能页面改版：${account.profileUrl}`);
   }
 
-  for (const post of posts.values()) {
-    const rsc = rscById.get(post.externalId);
-    const gql = graphqlById.get(post.externalId);
-    // API 是主来源；DOM 只在 API 缺失时兜底，避免 DOM 文案里的数字污染指标。
-    const apiLikes = maxCount(rsc?.likeCount, gql?.likes);
-    const apiComments = maxCount(rsc?.commentCount, gql?.comments);
-    const apiShares = maxCount(rsc?.repostCount, gql?.shares);
-    post.metrics.likes = apiLikes ?? post.metrics.likes;
-    post.metrics.comments = apiComments ?? post.metrics.comments;
-    post.metrics.shares = apiShares ?? post.metrics.shares;
-  }
-
   if (rscById.size || graphqlById.size) {
     await log("info", "metrics_sources", `互动数来源：RSC ${rscById.size} 条，GraphQL ${graphqlById.size} 条`, {
-      posts: posts.size,
+      context: { posts: posts.size },
     });
   }
 

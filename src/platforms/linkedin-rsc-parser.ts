@@ -170,9 +170,24 @@ export function activityIdsFromRsc(text: string): string[] {
       const u = extractUrn(it);
       if (u) urns.push(u);
     }
-    if (urns.length >= 1) return urns;
+    if (urns.length >= 1) return mergeWithOrdered(urns, text);
   }
-  return [];
+  return activityIdsInOrder(text);
+}
+
+/**
+ * root 解析只能拿到当前 body 里的 feed items，而且多份 RSC 拼在一起时 chunk id 会互相覆盖；
+ * 顺序抽取（activityIdsInOrder）能兜住所有散落的 URN。两边取并集，root 的顺序优先。
+ */
+function mergeWithOrdered(rootIds: string[], text: string): string[] {
+  const seen = new Set(rootIds);
+  const out = [...rootIds];
+  for (const id of activityIdsInOrder(text)) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
 }
 
 /**

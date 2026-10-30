@@ -12,7 +12,9 @@
     "web:start": "pnpm --dir web start",
     "db:backfill-linkedin": "node --experimental-strip-types scripts/backfill-linkedin-metrics.ts",
     "li:probe": "node --experimental-strip-types scripts/probe-linkedin-feed.ts",
-    "fb:parse": "node --experimental-strip-types scripts/probe-facebook-parse.ts"
+    "li:pag": "node --experimental-strip-types scripts/probe-linkedin-pagination.ts",
+    "fb:parse": "node --experimental-strip-types scripts/probe-facebook-parse.ts",
+    "fb:retry": "node --experimental-strip-types scripts/probe-facebook-retry.ts"
   },
   "dependencies": {
     "pg": "^8.22.0",

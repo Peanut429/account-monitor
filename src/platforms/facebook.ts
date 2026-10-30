@@ -494,6 +494,19 @@ async function acceptConsent(page: Page): Promise<void> {
   }
 }
 
+/**
+ * 首屏 0 条帖子时重新加载页面的最大重试次数（不含首次加载）。
+ * 参考项目是 3 次；这里单账号有 MONITOR_ACCOUNT_TIMEOUT_MS（默认 300s）上限，
+ * 一次失败尝试约 40-60s，取 2 次（最多 3 次加载）留出滚动抓取的时间。
+ */
+const FIRST_SCREEN_MAX_RETRIES = 2;
+/** 单次加载等首屏帖子卡片的时间。 */
+const FIRST_SCREEN_WAIT_MS = 20_000;
+/** 首屏等待 + 重载的总时间预算，避免把 MONITOR_ACCOUNT_TIMEOUT_MS 全部耗在重试上。 */
+const FIRST_SCREEN_RETRY_BUDGET_MS = 180_000;
+/** 预算不足这么多时间就不再发起下一次重载，避免刚重载就被单账号超时打断。 */
+const FIRST_SCREEN_RETRY_RESERVE_MS = 30_000;
+
 async function waitForStablePosts(
   page: Page,
   { timeoutMs = 30_000, minPosts = 1, stableMs = 1_600 } = {},
@@ -527,7 +540,51 @@ async function waitForFacebookReady(page: Page, timeoutMs = 30_000): Promise<voi
     return hasMain && !loginShell && (hasFeed || /粉丝|followers|关注|following/i.test(body));
   }, null, { timeout: timeoutMs }).catch(() => {});
   await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 12_000) }).catch(() => {});
-  await waitForStablePosts(page, { timeoutMs, minPosts: 1 }).catch(() => null);
+}
+
+/**
+ * Facebook 的 feed 请求超时后，右栏会停在骨架屏，底部显示“用时超出预期”（英文界面
+ * “This is taking longer than expected”）。此时 DOM 里一张帖子卡片都没有，
+ * 后续滚动永远拿不到帖子，只能整页重载重试。
+ */
+const STALLED_FEED_SOURCE = "用时超出预期|用时较长|花的时间比预期|taking longer than expected|took longer than expected";
+
+type FirstScreenState = { cards: number; stalled: boolean; timedOut: boolean };
+
+async function readFirstScreen(page: Page): Promise<{ cards: number; stalled: boolean }> {
+  return page.evaluate((pattern: string) => {
+    const body = document.body?.innerText || "";
+    return {
+      cards: document.querySelectorAll('[data-pagelet*="TimelineFeedUnit"]').length,
+      stalled: new RegExp(pattern, "i").test(body),
+    };
+  }, STALLED_FEED_SOURCE).catch(() => ({ cards: 0, stalled: false }));
+}
+
+/**
+ * 等首屏帖子卡片出现。
+ * - 卡片出现：再等卡片数量稳定（和原来 waitForStablePosts 一致），返回 timedOut=false。
+ * - 页面自己报了“用时超出预期”且又等了 8 秒还没有卡片：判定首屏卡死，提前返回等待重试。
+ * - 一直没卡片也没提示：等到超时，返回 timedOut=true。
+ */
+async function waitForFirstScreen(page: Page, timeoutMs = FIRST_SCREEN_WAIT_MS): Promise<FirstScreenState> {
+  const start = Date.now();
+  let stalledSince = 0;
+  while (Date.now() - start < timeoutMs) {
+    const state = await readFirstScreen(page);
+    if (state.cards > 0) {
+      await waitForStablePosts(page, { timeoutMs: 10_000, minPosts: 1 }).catch(() => null);
+      return { cards: state.cards, stalled: false, timedOut: false };
+    }
+    if (state.stalled) {
+      if (!stalledSince) stalledSince = Date.now();
+      if (Date.now() - stalledSince >= 8_000) return { cards: 0, stalled: true, timedOut: false };
+    } else {
+      stalledSince = 0;
+    }
+    await page.waitForTimeout(500);
+  }
+  return { cards: 0, stalled: stalledSince > 0, timedOut: true };
 }
 
 async function assertLoggedIn(page: Page): Promise<void> {
@@ -607,6 +664,17 @@ async function scrollTimeline(page: Page): Promise<{
   return { before, after };
 }
 
+async function reloadProfile(page: Page, profileUrl: string, hard: boolean): Promise<void> {
+  if (hard) {
+    // 软 reload 会复用已经卡死的前端状态，第二次起先跳 about:blank 再重新打开，强制重拉首屏。
+    await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {});
+    await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
+  } else {
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 90_000 });
+  }
+  await page.waitForTimeout(1_500);
+}
+
 async function scrapeFacebook({
   page,
   account,
@@ -618,15 +686,93 @@ async function scrapeFacebook({
   const collector = createNetworkCollector(page);
 
   try {
+    const maxFirstScreenRetries = Math.max(0, Number(
+      process.env.FACEBOOK_FIRST_SCREEN_RETRIES || FIRST_SCREEN_MAX_RETRIES,
+    ));
+    const retryBudgetMs = Math.max(0, Number(
+      process.env.FACEBOOK_FIRST_SCREEN_RETRY_BUDGET_MS || FIRST_SCREEN_RETRY_BUDGET_MS,
+    ));
+    const retryDeadline = Date.now() + retryBudgetMs;
+
+    const openProfile = async (): Promise<FirstScreenState> => {
+      await acceptConsent(page);
+      await waitForFacebookReady(page, 30_000);
+      await assertLoggedIn(page);
+      if (/\/login\b|\/checkpoint\b|\/recover\b/i.test(page.url())) {
+        throw new Error(`Facebook 未登录或需要验证：${account.profileUrl}`);
+      }
+      return waitForFirstScreen(page, FIRST_SCREEN_WAIT_MS);
+    };
+
     await log("info", "open_profile", `打开 ${account.profileUrl}`, { pageUrl: account.profileUrl });
     await page.goto(account.profileUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
     await page.waitForTimeout(2_000);
-    await acceptConsent(page);
-    await waitForFacebookReady(page, 30_000);
-    await assertLoggedIn(page);
 
-    if (/\/login\b|\/checkpoint\b|\/recover\b/i.test(page.url())) {
-      throw new Error(`Facebook 未登录或需要验证：${account.profileUrl}`);
+    let firstScreen = await openProfile();
+    let firstScreenRetries = 0;
+
+    // 首屏 0 帖子（最典型的是骨架屏 + “用时超出预期”）时整页重载重试；
+    // 只要接口已经抓到了帖子就继续走滚动，不再重载。
+    while (
+      firstScreen.cards === 0
+      && collector.stats().posts === 0
+      && firstScreenRetries < maxFirstScreenRetries
+      && Date.now() + FIRST_SCREEN_RETRY_RESERVE_MS < retryDeadline
+    ) {
+      firstScreenRetries += 1;
+      const reason = firstScreen.stalled
+        ? "页面停在骨架屏并提示“用时超出预期”"
+        : `等待 ${Math.round(FIRST_SCREEN_WAIT_MS / 1000)} 秒仍没有帖子卡片`;
+      await log(
+        "warn",
+        "facebook_retry",
+        `首屏没有加载出帖子（${reason}），第 ${firstScreenRetries}/${maxFirstScreenRetries} 次重新加载：${account.profileUrl}`,
+        {
+          pageUrl: page.url(),
+          context: {
+            retry: firstScreenRetries,
+            maxRetries: maxFirstScreenRetries,
+            stalled: firstScreen.stalled,
+            timedOut: firstScreen.timedOut,
+          },
+        },
+      );
+      await page.waitForTimeout(1_500 * firstScreenRetries);
+      try {
+        await reloadProfile(page, account.profileUrl, firstScreenRetries >= 2);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await log("warn", "facebook_retry_nav_failed", `第 ${firstScreenRetries} 次重载失败：${message}`, {
+          pageUrl: page.url(),
+        });
+      }
+      firstScreen = await openProfile();
+    }
+
+    if (firstScreenRetries > 0 && (firstScreen.cards > 0 || collector.stats().posts > 0)) {
+      await log(
+        "info",
+        "facebook_retry_ok",
+        `第 ${firstScreenRetries} 次重载后首屏恢复（卡片 ${firstScreen.cards}，接口帖子 ${collector.stats().posts}）`,
+        { pageUrl: page.url() },
+      );
+    }
+
+    if (
+      firstScreen.cards === 0
+      && collector.stats().posts === 0
+      && (firstScreen.stalled || firstScreen.timedOut)
+    ) {
+      const bodySample = await page.evaluate(() => (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 400))
+        .catch(() => "");
+      const stalledNote = firstScreen.stalled ? "，页面提示“用时超出预期”" : "";
+      const retryNote = firstScreenRetries > 0
+        ? `，重载 ${firstScreenRetries}/${maxFirstScreenRetries} 次仍为空`
+        : "，未重载";
+      throw new Error(
+        `Facebook 首屏没有加载出帖子（FACEBOOK_FIRST_SCREEN_TIMEOUT）：${account.profileUrl}`
+        + `，候选卡片=0${stalledNote}${retryNote}。页面文本：${bodySample}`,
+      );
     }
 
     // 与参考项目 facebook-network.ts 的 scrapeContent 保持一致：
