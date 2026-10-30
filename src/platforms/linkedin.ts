@@ -1,4 +1,4 @@
-import type { Page } from "playwright";
+import type { Page, Response } from "playwright";
 import { parseCount } from "../core/time.ts";
 import type { PlatformAdapter, PostRow, ScrapeContext, ScrapeResult } from "./types.ts";
 import { activityIdsFromRsc, parseRscFeed } from "./linkedin-rsc-parser.ts";
@@ -113,16 +113,39 @@ async function readCards(page: Page): Promise<LinkedInCard[]> {
     const out: LinkedInCard[] = [];
     const seen = new Set<string>();
 
-    const nodes = document.querySelectorAll('[data-urn*="urn:li:activity:"], [data-id*="urn:li:activity:"]');
-    for (const node of nodes) {
-      const raw = node.getAttribute("data-urn") || node.getAttribute("data-id") || "";
-      const match = raw.match(/urn:li:activity:(\d+)/);
-      if (!match) continue;
-      const activityId = match[1];
-      if (seen.has(activityId)) continue;
+    // 新版公司动态页的卡片不一定有 data-urn 了，activityId 可能只出现在链接 href
+    // （/feed/update/urn:li:activity:123/）或者某个 data-* 属性里。所以身份改为
+    // 从整张卡片的属性 + 链接 + 文案里正则提取，而不是死盯一个属性名。
+    const pickActivityId = (card: Element, cardText: string): string => {
+      const attributePairs: string[] = [];
+      for (const element of [card, ...card.querySelectorAll("*")]) {
+        if (!element.getAttributeNames) continue;
+        for (const name of element.getAttributeNames()) {
+          attributePairs.push(`${name}=${element.getAttribute(name) || ""}`);
+        }
+      }
+      const hrefs = [...card.querySelectorAll("a[href]")].map((anchor) => (anchor as HTMLAnchorElement).href);
+      const haystack = [...attributePairs, ...hrefs, cardText].join(" ");
+      for (const pattern of [/urn:li:activity[:%3A](\d{8,})/i, /activity[:-](\d{8,})/i, /activityId[=:](\d{8,})/i]) {
+        const match = haystack.match(pattern);
+        if (match) return match[1];
+      }
+      return "";
+    };
+
+    // .feed-shared-update-v2 / div[role="article"] 是参考项目长期在用的卡片外层，
+    // 比 data-urn 稳；data-urn 选择器保留，谁命中用谁。
+    const nodes = [...document.querySelectorAll(
+      '.feed-shared-update-v2, div[role="article"], [data-urn*="urn:li:activity:"], [data-id*="urn:li:activity:"]',
+    )];
+    // 只保留最内层候选，避免外层包裹节点把整页帖子的 id 都算到同一条上。
+    const leaves = nodes.filter((node) => !nodes.some((other) => other !== node && node.contains(other)));
+    for (const node of leaves) {
+      const container = (node.closest(".feed-shared-update-v2") || node) as Element;
+      const activityId = pickActivityId(container, text(container));
+      if (!activityId || seen.has(activityId)) continue;
       seen.add(activityId);
 
-      const container = node.closest(".feed-shared-update-v2") || node;
       const counts = container.querySelector(".social-details-social-counts");
       // 新版 LinkedIn 的 reaction 数不一定在 .social-details-social-counts 的 button 里，
       // 有些在 aria-label 或整张卡片的文本里。这里放宽到整张卡片，避免漏掉 "25 人赞"。
@@ -173,6 +196,48 @@ async function readLinkedInCapture(page: Page): Promise<{ rsc: string; graphql: 
       graphql: Array.isArray(w.__liGraphqlBodies) ? w.__liGraphqlBodies : [],
     };
   });
+}
+
+type LinkedInGraphqlCollector = {
+  bodies: unknown[];
+  stats: { apiResponses: number; feedResponses: number; sampleUrls: string[] };
+};
+
+/**
+ * 用 Playwright 的 CDP 响应事件收集 voyager GraphQL 响应。
+ *
+ * 参考项目 linkedin-network.ts 一直用 page.on("response") 这条路，服务器上稳定；
+ * 本项目之前只有 window.fetch 猴补丁，而 LinkedIn 的页面脚本会在启动时覆盖
+ * window.fetch，导致 5 天里一条 GraphQL 都没抓到（interface_mode 恒为 dom）。
+ * 两条路都留着：CDP 是主，猴补丁是备。
+ */
+function attachLinkedInGraphqlCollector(page: Page): LinkedInGraphqlCollector {
+  const bodies: unknown[] = [];
+  const stats = { apiResponses: 0, feedResponses: 0, sampleUrls: [] as string[] };
+
+  const handler = (response: Response): void => {
+    try {
+      const url = new URL(response.url());
+      if (!/linkedin\.com$/i.test(url.hostname)) return;
+      if (!["fetch", "xhr"].includes(response.request().resourceType())) return;
+      if (!/\/voyager\/api\/.*graphql\b/i.test(url.pathname) && !/\/graphql\b/i.test(url.pathname)) return;
+
+      stats.apiResponses += 1;
+      if (stats.sampleUrls.length < 6) stats.sampleUrls.push(url.pathname);
+      void response.json().then((json) => {
+        if (json && typeof json === "object") {
+          bodies.push(json);
+          stats.feedResponses += 1;
+        }
+      }).catch(() => {});
+    } catch {
+      // 单个响应取不到 body 不影响其它响应
+    }
+  };
+
+  page.on("response", handler);
+  // 账号跑完调用方会 close 页面，监听器随之释放，不需要单独 dispose。
+  return { bodies, stats };
 }
 
 async function installLinkedInCapture(page: Page): Promise<void> {
@@ -238,13 +303,25 @@ async function installLinkedInCapture(page: Page): Promise<void> {
 
 }
 
-async function readApiPostTimes(page: Page): Promise<Array<{ activityId: string; publishedTsMs: number }>> {
+async function readApiPostTimes(
+  page: Page,
+  extraGraphqlBodies: unknown[] = [],
+  extraRscText = "",
+): Promise<Array<{ activityId: string; publishedTsMs: number }>> {
   const captured = await readLinkedInCapture(page);
   const out = new Map<string, number>();
 
+  const bodies: unknown[] = [...extraGraphqlBodies];
   for (const text of captured.graphql) {
     try {
-      for (const post of parseLinkedInGraphqlPosts(JSON.parse(text)).values()) {
+      bodies.push(JSON.parse(text));
+    } catch {
+      // ignore malformed body
+    }
+  }
+  for (const json of bodies) {
+    try {
+      for (const post of parseLinkedInGraphqlPosts(json).values()) {
         if (post.publishedTsMs > 0) out.set(post.activityId, post.publishedTsMs);
       }
     } catch {
@@ -252,8 +329,10 @@ async function readApiPostTimes(page: Page): Promise<Array<{ activityId: string;
     }
   }
   try {
-    const ids = activityIdsFromRsc(captured.rsc);
-    for (const post of parseRscFeed(captured.rsc, ids)) {
+    // 首屏文档（sdui SSR）和 fetch 猴补丁抓到的分页 RSC 一起参与边界判断。
+    const rscText = `${extraRscText}\n${captured.rsc}`;
+    const ids = activityIdsFromRsc(rscText);
+    for (const post of parseRscFeed(rscText, ids)) {
       const ts = Date.parse(post.publishIso || "");
       if (Number.isFinite(ts) && ts > 0) out.set(post.activityId, ts);
     }
@@ -337,9 +416,13 @@ async function scrapeLinkedInInner({
   await log("info", "open_profile", `打开 ${account.profileUrl}`, { pageUrl: account.profileUrl });
 
   await installLinkedInCapture(page);
+  // 必须在 goto 之前挂，否则首屏的 feed GraphQL 响应会漏掉。
+  const network = attachLinkedInGraphqlCollector(page);
 
   const navResponse = await page.goto(account.profileUrl, { waitUntil: "domcontentloaded", timeout: 90_000 });
-  const docText = navResponse ? await navResponse.text().catch(() => "") : "";
+  // 新版 sdui 页面把公司动态随首屏文档 SSR 下发，不发 feed 请求，所以文档本身就是数据源。
+  // 文档里多一层 `\"` 转义，反转义后才能正常抽出帖子编号和互动计数。
+  const docText = navResponse ? (await navResponse.text().catch(() => "")).replace(/\\+"/g, "\"") : "";
   await page.waitForTimeout(4_000);
 
   if (/\/login\b|\/authwall\b|\/checkpoint\b/i.test(page.url())) {
@@ -408,7 +491,7 @@ async function scrapeLinkedInInner({
     }
 
     // API-only 帖子也可能先于 DOM 卡片出现，同样参与 72h 边界判断。
-    for (const api of await readApiPostTimes(page)) {
+    for (const api of await readApiPostTimes(page, network.bodies, docText)) {
       if (boundarySeen.has(api.activityId)) continue;
       boundarySeen.add(api.activityId);
       if (api.publishedTsMs < sinceTsMs) consecutiveBeforeRange += 1;
@@ -441,9 +524,17 @@ async function scrapeLinkedInInner({
 
   const graphqlById = new Map<string, LinkedInGraphqlCounts>();
   const graphqlPostById = new Map<string, LinkedInGraphqlPost>();
+  // CDP 收到的 JSON body 已经解析过；猴补丁收到的是文本，这里统一成对象再解析。
+  const graphqlBodies: unknown[] = [...network.bodies];
   for (const text of captured.graphql) {
     try {
-      const json = JSON.parse(text);
+      graphqlBodies.push(JSON.parse(text));
+    } catch {
+      // 非 JSON body 直接跳过
+    }
+  }
+  for (const json of graphqlBodies) {
+    try {
       for (const [activityId, counts] of parseLinkedInGraphqlCounts(json)) {
         const prev = graphqlById.get(activityId);
         graphqlById.set(activityId, {
@@ -526,6 +617,11 @@ async function scrapeLinkedInInner({
     rscActivityIds: rscActivityIds.length,
     graphqlPosts: graphqlPostById.size,
     posts: posts.size,
+    // API 抓取诊断：下次再出问题，直接看这几个数就知道是没抓到响应、还是解析不出来。
+    apiResponses: network.stats.apiResponses,
+    apiBodies: network.stats.feedResponses,
+    rscBodies: captured.rsc.length,
+    apiSampleUrls: network.stats.sampleUrls,
   });
 
   if (!posts.size) {

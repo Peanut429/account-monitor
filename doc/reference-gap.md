@@ -47,7 +47,7 @@
 
 | 参考项目 | 当前实现 | 状态 |
 |---|---|---|
-| `linkedin-rsc-parser.ts` | 原样复制 | 已对齐 |
+| `linkedin-rsc-parser.ts` | 原样复制，2026-10-31 同步到 `0b24248` | 已对齐 |
 | RSC `ReactionType_*` / comment / repost | 已实现 | 已对齐 |
 | GraphQL `SocialActivityCounts` counts | 已实现 | 已对齐 |
 | GraphQL feed 帖子正文/URL/时间 | 已实现 `parseLinkedInGraphqlPosts` | 已对齐 |
@@ -61,7 +61,39 @@
 | 无帖子页面判断 | 已处理“暂无企业快讯” | 已对齐 |
 | 目标公司页重定向校验 | 已移植路径校验 | 已对齐 |
 | DOM 卡片外层 | 仍保留，作为兜底 | 与参考不同但保留 |
+| 帖子身份提取 | `[data-urn*=urn:li:activity:]` 单属性 | 已改为多来源提取（属性 + 链接 + 文案正则） |
+| sdui 首屏文档解析 | 2026-10-31 已同步 `0b24248` | 已对齐，见下节 |
 | checkpoint / Excel / CLI | 本项目不需要 | 不适用 |
+
+### LinkedIn 卡片来源（2026-10-30 事故结论）
+
+原来本项目的帖子主来源是 DOM 里 `data-urn` 上的 activityId，GraphQL/RSC 只靠 `window.fetch` 猴补丁抓，
+而参考项目的主来源是 `page.on("response")` 拿 voyager GraphQL。
+
+- 项目跑了 5 天，`interface_mode` 689 条全是 `dom`，GraphQL/RSC 一次都没生效。
+- 10-30 08:00 LinkedIn 改了公司动态页 DOM，`data-urn` 消失，于是 19/19 全失败，参考项目不受影响。
+
+修复：
+
+- GraphQL 改用 `page.on("response")` + `response.json()`（与 `linkedin-network.ts` 同路），猴补丁降级为备。
+- DOM 兜底改用 `.feed-shared-update-v2 / div[role="article"]` 选卡片，activityId 从属性 + 链接 + 文案正则兜底提取。
+- `interface_mode` 日志新增 `apiResponses / apiBodies / rscBodies / apiSampleUrls`，下次可直接判断是没抓到还是解析不出来。
+
+### LinkedIn sdui 首屏文档（2026-10-31 同步参考项目 `0b24248`）
+
+参考项目 2026-10-31 00:25 的 `fix: 修复linkedin rsc解析` 指出：公司动态已经改成 **sdui SSR 随首屏文档下发**，
+不再发 `rsc-action/actions/pagination` 分页请求，页面上也没有可用的 DOM 卡片外层。
+
+| 参考项目改动 | 本项目 |
+|---|---|
+| `activityIdsFromRsc` 找不到根 chunk `0` 时回退 `activityIdsInOrder(text)` | 已同步（原来直接 `return []`，这是 10-30 全挂的直接原因） |
+| `activityIdsInOrder` 过滤长度 < 15 的截断编号 | 已同步 |
+| 首屏文档 `\"` 反转义后再解析 | 已同步 |
+| 首屏文档参与 activityId 收集与去重 | 本项目本来就把 `docText` 拼进 RSC 文本，现在才真正解析得出来 |
+| 探测阶段把「首屏文档里有 activityId」判定为 rsc | 本项目按解析结果判定，同步后自然命中 |
+
+snowflake 时间戳已用真实数据核对：`7521179981826310146 → 2026-10-28 20:04 (UTC+8)`，
+与库里同批次帖子 `published_ts_ms` 一致，新格式编号位布局没变。
 
 ## 数据口径
 

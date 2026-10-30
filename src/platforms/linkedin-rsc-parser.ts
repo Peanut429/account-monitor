@@ -111,15 +111,23 @@ export function activityIdsInOrder(text: string): string[] {
   let m: RegExpExecArray | null;
   ACTIVITY_URN_RE.lastIndex = 0;
   while ((m = ACTIVITY_URN_RE.exec(text))) {
+    // 文档里会出现被截断的编号（如 7521179981，实为 7521179981826310146 的前 10 位），
+    // 真实 activityId 是 18–19 位 snowflake，短于 15 位的一律不是帖子编号。
+    if (m[1].length < 15) continue;
     if (!seen.has(m[1])) { seen.add(m[1]); out.push(m[1]); }
   }
   return out;
 }
 
 /**
- * 从单个 RSC 分页响应里，按 feed 顺序提取所有帖子的 activityId。
- * 来源：feed item 的 `viewTrackingSpecs.trackingScope[0].breadcrumb.content`（Buffer），
- * 解码后是 `{"updateUrn":"urn:li:activity:<id>"}`，这是唯一且与渲染顺序一致的可靠标识。
+ * 从单个 RSC 响应（分页响应或首屏文档）里提取所有帖子的 activityId。
+ *
+ * 老格式（带根 chunk `0`）：feed item 的 `viewTrackingSpecs.trackingScope[0].breadcrumb.content`（Buffer），
+ * 解码后是 `{"updateUrn":"urn:li:activity:<id>"}`。
+ *
+ * 新格式（sdui，没有根 chunk `0`，2026-10-30 起）：动态随首屏文档 SSR 下发，根本不发 feed 请求，
+ * activityId 以 `feedUpdateUrn…activityId` / `urn:li:activity:<id>` 的形式散在 chunk 里，
+ * 只能按出现顺序去重抽取。这里不再返回空数组，否则整条链路会静默变成 0 条。
  */
 export function activityIdsFromRsc(text: string): string[] {
   const chunks = new Map<string, any>();
@@ -132,7 +140,7 @@ export function activityIdsFromRsc(text: string): string[] {
     try { chunks.set(m[1], JSON.parse(raw)); } catch { /* ignore */ }
   }
   const root = chunks.get("0");
-  if (!Array.isArray(root)) return [];
+  if (!Array.isArray(root)) return activityIdsInOrder(text);
 
   const extractUrn = (node: any): string | null => {
     let found: string | null = null;
